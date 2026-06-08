@@ -24,52 +24,84 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 
 # ---------------------------------------------------------------------------
+# Color logging (works in terminal)
+# ---------------------------------------------------------------------------
+
+class ColorFormatter(logging.Formatter):
+    """Add colors to log levels"""
+    COLORS = {
+        'INFO': '\033[92m',     # Green
+        'WARNING': '\033[93m',  # Yellow
+        'ERROR': '\033[91m',    # Red
+        'MOUNT': '\033[94m',    # Blue for mount
+        'UNMOUNT': '\033[95m',  # Magenta for unmount
+        'RESET': '\033[0m'
+    }
+    
+    def format(self, record):
+        levelname = record.levelname
+        if levelname in self.COLORS:
+            record.levelname = f"{self.COLORS[levelname]}{levelname}{self.COLORS['RESET']}"
+        
+        # Special colors for mount/unmount messages
+        if 'Mounted' in record.getMessage():
+            record.msg = f"{self.COLORS['MOUNT']}🔗 {record.msg}{self.COLORS['RESET']}"
+        elif 'Unmounted' in record.getMessage():
+            record.msg = f"{self.COLORS['UNMOUNT']}❌ {record.msg}{self.COLORS['RESET']}"
+        
+        return super().format(record)
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path("/tmp/labdata")
-USERS_DIR = BASE_DIR / "users"       # Permanent per-user data directories
-SESSIONS_DIR = BASE_DIR / "sessions"  # Mount points exposed to Samba
+USERS_DIR = BASE_DIR / "users"
+SESSIONS_DIR = BASE_DIR / "sessions"
 
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"  # Listen on all interfaces (so Windows can connect via Samba)
 PORT = 5000
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging setup
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(ColorFormatter('%(asctime)s [%(levelname)s] %(message)s'))
+
 log = logging.getLogger("lab-daemon")
+log.setLevel(logging.INFO)
+log.addHandler(console_handler)
+
+# Also log to file
+#file_handler = logging.FileHandler('/tmp/lab-daemon.log')
+
+#file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+#log.addHandler(file_handler)
 
 # ---------------------------------------------------------------------------
 # Low-level mount helpers (no shell=True)
 # ---------------------------------------------------------------------------
 
-# Load libc for mount(2) / umount(2) syscalls
 _libc_name = ctypes.util.find_library("c")
 if _libc_name is None:
     sys.exit("FATAL: cannot locate libc")
 _libc = ctypes.CDLL(_libc_name, use_errno=True)
 
-# mount(2) flags
 MS_BIND = 4096
 
 
 def _mount_bind(source: Path, target: Path) -> None:
-    """
-    Create a bind mount from *source* to *target* using the mount(2) syscall.
-
-    Raises OSError on failure.
-    """
+    """Create a bind mount using mount(2) syscall."""
+    # Ensure target parent exists
+    target.parent.mkdir(parents=True, exist_ok=True)
+    
     ret = _libc.mount(
-        str(source).encode(),   # source
-        str(target).encode(),   # target
-        None,                   # filesystemtype (ignored for bind)
-        MS_BIND,                # mountflags
-        None,                   # data
+        str(source).encode(),
+        str(target).encode(),
+        None,
+        MS_BIND,
+        None,
     )
     if ret != 0:
         err = ctypes.get_errno()
@@ -77,11 +109,7 @@ def _mount_bind(source: Path, target: Path) -> None:
 
 
 def _umount(target: Path) -> None:
-    """
-    Unmount *target* using the umount(2) syscall.
-
-    Raises OSError on failure.
-    """
+    """Unmount using umount(2) syscall."""
     ret = _libc.umount(str(target).encode())
     if ret != 0:
         err = ctypes.get_errno()
@@ -89,10 +117,7 @@ def _umount(target: Path) -> None:
 
 
 def _is_mountpoint(path: Path) -> bool:
-    """
-    Check whether *path* is currently a mount point by parsing /proc/self/mountinfo.
-    Returns False if the path does not exist.
-    """
+    """Check if path is a mount point."""
     if not path.exists():
         return False
     try:
@@ -100,9 +125,8 @@ def _is_mountpoint(path: Path) -> bool:
         with open("/proc/self/mountinfo", "r") as f:
             for line in f:
                 parts = line.strip().split()
-                if len(parts) > 4:
-                    if parts[4] == target_path:
-                        return True
+                if len(parts) > 4 and parts[4] == target_path:
+                    return True
     except OSError:
         pass
     return False
@@ -111,172 +135,128 @@ def _is_mountpoint(path: Path) -> bool:
 # Request validation
 # ---------------------------------------------------------------------------
 
-
-def _validate_request() -> tuple[dict | None, tuple | None]:
-    """
-    Parse and validate the incoming JSON body.
-
-    Returns (payload, None) on success or (None, error_response_tuple) on
-    failure.  The error tuple is (response_dict, http_status_code).
-    """
+def _validate_request():
     data = request.get_json(silent=True)
     if data is None:
-        return None, (
-            {"status": "error", "message": "Request body must be valid JSON"},
-            400,
-        )
+        return None, ({"error": "Invalid JSON"}, 400)
 
     user = data.get("user", "").strip()
     tool = data.get("tool", "").strip()
 
     if not user or not tool:
-        return None, (
-            {"status": "error", "message": "'user' and 'tool' are required"},
-            400,
-        )
+        return None, ({"error": "'user' and 'tool' required"}, 400)
 
-    # Guard against path traversal
     for name in (user, tool):
         if "/" in name or "\\" in name or name in (".", ".."):
-            return None, (
-                {"status": "error", "message": "Invalid characters in user/tool name"},
-                400,
-            )
+            return None, ({"error": "Invalid characters"}, 400)
 
     return data, None
 
 # ---------------------------------------------------------------------------
-# Flask application
+# Flask app
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
 
 
 @app.route("/mount", methods=["POST"])
+
 def mount_endpoint():
-    """
-    Bind-mount a user's data directory into a tool session path.
-
-    POST /mount
-    Body: {"user": "<username>", "tool": "<toolname>"}
-
-    Creates:
-      source: /tmp/labdata/users/<user>
-      target: /tmp/labdata/sessions/<tool>/<user>
-
-    Both directories are created if they do not already exist.
-    """
+    
     data, err = _validate_request()
-    if err is not None:
+    if err:
         return jsonify(err[0]), err[1]
 
-    user = data["user"].strip()
-    tool = data["tool"].strip()
+    user = data["user"]
+    tool = data["tool"]
 
     source = USERS_DIR / user
     target = SESSIONS_DIR / tool / user
 
-    # Create directories if they don't exist
+    # Log the user action prominently
+    log.info(f"🔐 USER ACTION: {user} logging into {tool}")
+    
+    # Create directories
     try:
         source.mkdir(parents=True, exist_ok=True)
         target.mkdir(parents=True, exist_ok=True)
+        if source.exists() and source.is_dir():
+            log.info(f"📁 User directory ready: {source}")
+        else:
+            log.info(f"📁 Created new user directory: {source}")
     except OSError as exc:
-        log.error("Failed to create directories: %s", exc)
-        return jsonify({"status": "error", "message": f"Directory creation failed: {exc}"}), 500
+        log.error(f"Failed to create directories: {exc}")
+        return jsonify({"error": str(exc)}), 500
 
     # Check if already mounted
     if _is_mountpoint(target):
-        log.info("Already mounted: %s -> %s", source, target)
-        return jsonify({
-            "status": "ok",
-            "message": "Already mounted",
-            "source": str(source),
-            "target": str(target),
-        }), 200
+        log.info(f"✅ {user} already has active session on {tool}")
+        return jsonify({"status": "already_mounted"}), 200
 
-    # Perform the bind mount
+    # Perform mount
     try:
         _mount_bind(source, target)
+        log.info(f"✅ MOUNT SUCCESS: {user} → {tool}")
+        log.info(f"   Source: {source}")
+        log.info(f"   Target: {target}")
+        return jsonify({"status": "mounted", "path": str(target)}), 201
     except OSError as exc:
-        log.error("mount(%s, %s) failed: %s", source, target, exc)
-        return jsonify({"status": "error", "message": f"Mount failed: {exc}"}), 500
-
-    log.info("Mounted: %s -> %s", source, target)
-    return jsonify({
-        "status": "ok",
-        "message": "Bind mount created",
-        "source": str(source),
-        "target": str(target),
-    }), 201
+        log.error(f"❌ MOUNT FAILED for {user} on {tool}: {exc}")
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/unmount", methods=["POST"])
 def unmount_endpoint():
-    """
-    Unmount a previously created bind mount for a tool session.
-
-    POST /unmount
-    Body: {"user": "<username>", "tool": "<toolname>"}
-    """
     data, err = _validate_request()
-    if err is not None:
+    if err:
         return jsonify(err[0]), err[1]
 
-    user = data["user"].strip()
-    tool = data["tool"].strip()
+    user = data["user"]
+    tool = data["tool"]
 
     target = SESSIONS_DIR / tool / user
 
-    # Check that the target exists and is a mount point
     if not target.exists():
-        return jsonify({
-            "status": "error",
-            "message": f"Target path does not exist: {target}",
-        }), 404
+        return jsonify({"error": "Not found"}), 404
 
     if not _is_mountpoint(target):
-        return jsonify({
-            "status": "error",
-            "message": f"Target is not a mount point: {target}",
-        }), 400
+        return jsonify({"error": "Not a mount point"}), 400
 
-    # Perform the unmount
     try:
         _umount(target)
+        log.info(f"Unmounted: {user} from {tool} [{target}]")
+        
+        # Remove the empty directory after unmount
+        try:
+            target.rmdir()
+            log.info(f"Removed empty session directory: {target}")
+        except OSError as e:
+            log.warning(f"Could not remove {target}: {e}")
+        
+        return jsonify({"status": "unmounted"}), 200
     except OSError as exc:
-        log.error("umount(%s) failed: %s", target, exc)
-        return jsonify({"status": "error", "message": f"Unmount failed: {exc}"}), 500
-
-    log.info("Unmounted: %s", target)
-    return jsonify({
-        "status": "ok",
-        "message": "Bind mount removed",
-        "target": str(target),
-    }), 200
-
-
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
+        log.error(f"Unmount failed: {exc}")
+        return jsonify({"error": str(exc)}), 500
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Simple liveness probe."""
     return jsonify({"status": "ok"}), 200
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Warn (but don't block) if not running as root
     if os.geteuid() != 0:
-        log.warning(
-            "Not running as root — mount/umount operations will fail. "
-            "Re-run with: sudo python3 %s",
-            sys.argv[0],
-        )
-
-    log.info("Starting Lab Data Mount Daemon on %s:%d", HOST, PORT)
+        log.warning("Not running as root — mounts will fail! Run with sudo")
+    
+    # Ensure base directories exist
+    USERS_DIR.mkdir(parents=True, exist_ok=True)
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    
+    log.info(f"Starting Lab Data Mount Daemon on {HOST}:{PORT}")
+    log.info(f"Users directory: {USERS_DIR}")
+    log.info(f"Sessions directory: {SESSIONS_DIR}")
+    
     app.run(host=HOST, port=PORT, debug=False)
