@@ -1,0 +1,20 @@
+storage:
+  base_path: "/srv/labdata"
+  users_path: "/srv/labdata/users"
+  groups_path: "/srv/labdata/groups"
+  sessions_path: "/tmp/labdata/sessions"
+
+quota:
+  default_soft: 10  # GB
+  default_hard: 12  # GB
+
+session:
+  db_path: "/var/lib/lab-daemon/sessions.json"
+  idle_timeout_minutes: 60
+  unmount_grace_seconds: 30
+
+group_mapping:
+  alice: "cleanroom"
+  bob: "cleanroom"
+  charlie: "metrology"
+  admin: "staff"
