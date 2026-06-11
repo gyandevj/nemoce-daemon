@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 
 import yaml
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 
 # Import custom managers
 from session_state import SessionStateManager
@@ -85,7 +85,8 @@ DEFAULT_CONFIG = {
         "base_path": "/srv/labdata",
         "users_path": "/srv/labdata/users",
         "groups_path": "/srv/labdata/groups",
-        "sessions_path": "/tmp/labdata/sessions"
+        "sessions_path": "/tmp/labdata/sessions",
+        "public_path": "/srv/labdata/public"
     },
     "quota": {
         "default_soft": 10,  # GB
@@ -135,6 +136,7 @@ BASE_DIR = Path(config["storage"]["base_path"])
 USERS_DIR = Path(config["storage"]["users_path"])
 GROUPS_DIR = Path(config["storage"]["groups_path"])
 SESSIONS_DIR = Path(config["storage"]["sessions_path"])
+PUBLIC_DIR = Path(config["storage"].get("public_path", "/srv/labdata/public"))
 
 SECRET_KEY = b"00d57012a01b31f8364ebdcda42f05d15c3fd5585c69be1b8cdec1c30caa3af7"
 HOST = "0.0.0.0"  # Listen on all interfaces
@@ -156,6 +158,8 @@ else:
     _libc = ctypes.CDLL(_libc_name, use_errno=True)
 
 MS_BIND = 4096
+MS_RDONLY = 1
+MS_REMOUNT = 32
 
 
 def _mount_bind(source: Path, target: Path) -> None:
@@ -171,6 +175,39 @@ def _mount_bind(source: Path, target: Path) -> None:
         str(target).encode(),
         None,
         MS_BIND,
+        None,
+    )
+    if ret != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
+
+def _mount_bind_ro(source: Path, target: Path) -> None:
+    """Create a read-only bind mount using mount(2) syscall."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    
+    if not _libc:
+        log.warning(f"Mocking RO Bind Mount: {source} → {target}")
+        return
+
+    # Step 1: Standard bind mount
+    ret = _libc.mount(
+        str(source).encode(),
+        str(target).encode(),
+        None,
+        MS_BIND,
+        None,
+    )
+    if ret != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
+    # Step 2: Remount read-only
+    ret = _libc.mount(
+        None,
+        str(target).encode(),
+        None,
+        MS_BIND | MS_REMOUNT | MS_RDONLY,
         None,
     )
     if ret != 0:
@@ -436,11 +473,26 @@ def mount_endpoint():
 
             mount_points.append(f"{source_group} → {target_group}")
 
+    # Perform public directory RO mount if it exists
+    if PUBLIC_DIR.exists() and PUBLIC_DIR.is_dir():
+        target_public = SESSIONS_DIR / tool / "public"
+        try:
+            target_public.mkdir(parents=True, exist_ok=True)
+            public_already_mounted = _is_mountpoint(target_public)
+            if public_already_mounted:
+                log.info(f"✅ Public directory already mounted on {tool}")
+            else:
+                _mount_bind_ro(PUBLIC_DIR, target_public)
+                log.info(f"✅ MOUNT SUCCESS (PUBLIC RO): {PUBLIC_DIR} → {target_public}")
+            mount_points.append(f"{PUBLIC_DIR} → {target_public}")
+        except Exception as exc:
+            log.error(f"❌ MOUNT FAILED for public directory on {tool}: {exc}")
+
     # Save session state to database
     session_manager.save_session(session_id, user, tool, mount_points)
 
     response_body = {
-        "status": "mounted",
+        "status": "already_mounted" if user_already_mounted else "mounted",
         "path": str(target_user),
         "session_id": session_id
     }
@@ -585,6 +637,47 @@ def get_user_quota(username):
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
+
+
+@app.route("/files/<user>", methods=["GET"])
+def list_files(user):
+    if "/" in user or "\\" in user or user in (".", ".."):
+        return jsonify({"error": "Invalid user name"}), 400
+    
+    user_dir = USERS_DIR / user
+    if not user_dir.exists() or not user_dir.is_dir():
+        return jsonify({"error": f"User directory for {user} does not exist"}), 404
+        
+    try:
+        files = [f for f in os.listdir(user_dir) if os.path.isfile(user_dir / f)]
+    except Exception as e:
+        return jsonify({"error": f"Failed to list files: {str(e)}"}), 500
+        
+    html = f"<html><head><title>Files for {user}</title></head><body>"
+    html += f"<h1>Files for {user}</h1>"
+    if not files:
+        html += "<p>No files found.</p>"
+    else:
+        html += "<ul>"
+        for f in files:
+            html += f'<li><a href="/download/{user}/{f}">{f}</a></li>'
+        html += "</ul>"
+    html += "</body></html>"
+    return html
+
+
+@app.route("/download/<user>/<filename>", methods=["GET"])
+def download_file(user, filename):
+    if "/" in user or "\\" in user or user in (".", ".."):
+        return jsonify({"error": "Invalid user name"}), 400
+    if "/" in filename or "\\" in filename or filename in (".", ".."):
+        return jsonify({"error": "Invalid filename"}), 400
+        
+    user_dir = USERS_DIR / user
+    if not user_dir.exists() or not user_dir.is_dir():
+        return jsonify({"error": f"User directory for {user} does not exist"}), 404
+        
+    return send_from_directory(user_dir, filename)
 
 # ---------------------------------------------------------------------------
 # Auto-unmount Callback for Idle Session Monitor
