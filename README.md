@@ -173,12 +173,17 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/root/nemoce-daemon
-ExecStart=/root/nemoce-daemon/venv/bin/python daemon.py
+ExecStart=/root/nemoce-daemon/venv/bin/python -u daemon.py
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 ```
+To view the live logs from the service, run:
+```bash
+journalctl -u lab-daemon -f
+```
+
 
 ---
 
