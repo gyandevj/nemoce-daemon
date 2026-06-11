@@ -65,12 +65,14 @@ class IdleMonitor(threading.Thread):
                 if activity > max_activity:
                     max_activity = activity
 
-            # If no folders exist yet, default to the mount time
-            if max_activity == 0.0:
-                max_activity = float(session_info.get("mount_time", now))
+            # Ensure max_activity is at least the mount_time of the session
+            mount_time = float(session_info.get("mount_time", now))
+            if max_activity < mount_time:
+                max_activity = mount_time
 
             idle_time = now - max_activity
             if idle_time > self.idle_timeout_seconds:
+
                 logger.info(f"⏳ Idle Monitor: Session '{session_id}' ({user} on {tool}) has been idle for {int(idle_time // 60)} minutes. Triggering auto-unmount.")
                 try:
                     # Execute unmount callback
