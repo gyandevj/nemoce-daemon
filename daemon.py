@@ -617,6 +617,56 @@ def unmount_endpoint():
         return jsonify({"error": "Failed to unmount cleanly"}), 500
 
 
+@app.route("/init_user", methods=["POST"])
+def init_user_endpoint():
+    data = request.get_json(silent=True)
+    if data is None:
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    user = data.get("user", "").strip()
+    tool = data.get("tool", "system").strip()
+
+    if not user:
+        return jsonify({"error": "'user' required"}), 400
+
+    for name in (user, tool):
+        if "/" in name or "\\" in name or name in (".", ".."):
+            return jsonify({"error": "Invalid characters"}), 400
+
+    auth_err = verify_hmac(user, tool)
+    if auth_err:
+        return auth_err
+
+    log.info(f"🔐 USER INITIALIZATION: {user}")
+
+    source_user = USERS_DIR / user
+
+    try:
+        if not source_user.exists():
+            source_user.mkdir(parents=True, exist_ok=True)
+            log.info(f"📁 Initialized storage directory for user: {source_user}")
+            status = "initialized"
+        else:
+            log.info(f"📁 User storage directory already exists: {source_user}")
+            status = "already_exists"
+    except OSError as exc:
+        log.error(f"Failed to create user directory: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+    # Apply default disk quota
+    quota_manager.apply_quota(
+        user,
+        config["quota"]["default_soft"],
+        config["quota"]["default_hard"],
+        USERS_DIR
+    )
+
+    return jsonify({
+        "status": status,
+        "path": str(source_user)
+    }), 200
+
+
 @app.route("/sessions", methods=["GET"])
 def get_sessions():
     """
