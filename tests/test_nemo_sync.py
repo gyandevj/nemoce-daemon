@@ -1,0 +1,76 @@
+import os
+import sys
+import unittest
+from unittest.mock import MagicMock, patch
+import tempfile
+
+# Add parent directory to path
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+from modules.state_db import StateDB
+from modules.nemo_sync import NemoSync
+from modules.user_provisioner import UserProvisioner
+
+class TestNemoSync(unittest.TestCase):
+    def setUp(self):
+        self.db_fd, self.db_path = tempfile.mkstemp()
+        self.db = StateDB(self.db_path)
+        
+        self.mock_api = MagicMock()
+        self.mock_provisioner = MagicMock()
+        
+        # Setup mock return values
+        self.mock_api.get_accounts.return_value = [
+            {"id": 20, "name": "Nathalie de Leon", "active": True}
+        ]
+        self.mock_api.get_projects.return_value = [
+            {"id": 426, "account": 20, "name": "C2QA-De Leon", "active": True}
+        ]
+        self.mock_api.get_users.return_value = [
+            {"id": 146, "username": "alex.abulnaga", "first_name": "Alex", "last_name": "Abulnaga", "is_active": True, "projects": [426]}
+        ]
+
+        # Use temporary directories in mock provisioner
+        self.mock_provisioner.groups_path = "/srv/labdata/groups"
+        self.mock_provisioner.users_path = "/srv/labdata/users"
+        self.mock_provisioner.quota_soft_gb = 10
+        self.mock_provisioner.quota_hard_gb = 12
+
+        self.sync = NemoSync(
+            api_client=self.mock_api,
+            db=self.db,
+            user_provisioner=self.mock_provisioner,
+            on_deactivation="lock_account",
+            dry_run=False
+        )
+
+    def tearDown(self):
+        os.close(self.db_fd)
+        try:
+            os.unlink(self.db_path)
+        except OSError:
+            pass
+
+    def test_run_once(self):
+        # Run sync once
+        self.sync.run_once()
+
+        # Check that DB was populated
+        user = self.db.get_user_by_id(146)
+        self.assertIsNotNone(user)
+        self.assertEqual(user["username"], "alex.abulnaga")
+
+        # Check membership populated
+        projects = self.db.get_user_projects(146)
+        self.assertIn(426, projects)
+
+        # Verify provisioner was called
+        self.mock_provisioner.provision_user.assert_called_with(146, "alex.abulnaga")
+        self.mock_provisioner.ensure_user_directory.assert_called_with(146)
+        self.mock_provisioner.ensure_project_directory.assert_called_with(20, 426)
+        self.mock_provisioner.sync_user_groups.assert_called_with(146, [426])
+
+if __name__ == "__main__":
+    unittest.main()

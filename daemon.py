@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Lab Data Mount Daemon
-=====================
+Lab Data Mount Daemon (Hierarchical Version)
+============================================
 A Flask daemon that manages bind mounts for lab instrument sessions.
 
 Exposes endpoints:
-  /mount   — bind-mounts user and group directories into a tool session path (HMAC signed)
-  /unmount — removes bind mounts gracefully, waiting if files are open (HMAC signed)
+  /mount   — bind-mounts user, group, and public directories into a tool session path (HMAC signed using user_id)
+  /unmount — removes bind mounts gracefully, waiting if files are open (HMAC signed using user_id)
   /sessions — lists all active sessions
-  /quota/<username> — lists disk quota usage for the specified user
+  /projects/<user_id> — lists projects a user belongs to
+  /quota/<username_or_id> — lists disk quota usage for the specified user
+  /init_user — initializes user directory and quotas dynamically (HMAC signed)
   /health  — health check endpoint
 
 Designed to run on WSL2 (Ubuntu 24.04) with Python 3.11+.
@@ -31,11 +33,15 @@ from pathlib import Path
 import yaml
 from flask import Flask, jsonify, request, send_from_directory
 
-# Import custom managers
-from session_state import SessionStateManager
+# Import custom modules
+from modules.state_db import StateDB
+from modules.nemo_api_client import NemoAPIClient
+from modules.user_provisioner import UserProvisioner
+from modules.samba_controller import SambaController
+from modules.nemo_sync import NemoSync
+from idle_monitor import IdleMonitor
 import acl_manager
 import quota_manager
-from idle_monitor import IdleMonitor
 
 # ---------------------------------------------------------------------------
 # Color logging (works in terminal)
@@ -93,15 +99,17 @@ DEFAULT_CONFIG = {
         "default_hard": 12   # GB
     },
     "session": {
-        "db_path": "/var/lib/lab-daemon/sessions.json",
+        "db_path": "/var/lib/lab-daemon/state.db",
         "idle_timeout_minutes": 60,
         "unmount_grace_seconds": 30
     },
-    "group_mapping": {
-        "alice": "cleanroom",
-        "bob": "cleanroom",
-        "charlie": "metrology",
-        "admin": "staff"
+    "nemo": {
+        "django_path": "/mnt/c/Users/gyand/Desktop/NemoProject/nemo-ce",
+        "poll_interval_seconds": 3600
+    },
+    "sync": {
+        "on_deactivation": "lock_account",
+        "dry_run": False
     }
 }
 
@@ -122,11 +130,9 @@ for loc in config_locations:
                 loaded = yaml.safe_load(f)
                 if loaded:
                     # Deep merge configuration
-                    for section in ["storage", "quota", "session"]:
+                    for section in ["storage", "quota", "session", "nemo", "sync"]:
                         if section in loaded and isinstance(loaded[section], dict):
                             config[section].update(loaded[section])
-                    if "group_mapping" in loaded and isinstance(loaded["group_mapping"], dict):
-                        config["group_mapping"].update(loaded["group_mapping"])
             log.info(f"Loaded configuration from: {loc}")
             break
         except Exception as e:
@@ -139,11 +145,33 @@ SESSIONS_DIR = Path(config["storage"]["sessions_path"])
 PUBLIC_DIR = Path(config["storage"].get("public_path", "/srv/labdata/public"))
 
 SECRET_KEY = b"00d57012a01b31f8364ebdcda42f05d15c3fd5585c69be1b8cdec1c30caa3af7"
-HOST = "0.0.0.0"  # Listen on all interfaces
+HOST = "0.0.0.0"
 PORT = 5000
 
-# Instantiate session manager
-session_manager = SessionStateManager(config["session"]["db_path"])
+# Instantiate Managers and Clients
+state_db = StateDB(config["session"]["db_path"])
+nemo_client = NemoAPIClient(
+    django_path=config["nemo"].get("django_path"),
+    use_api_http=config["nemo"].get("use_api_http", False),
+    api_url=config["nemo"].get("api_url"),
+    api_token=config["nemo"].get("api_token")
+)
+user_provisioner = UserProvisioner(
+    base_path=config["storage"]["base_path"],
+    users_path=config["storage"]["users_path"],
+    groups_path=config["storage"]["groups_path"],
+    quota_soft_gb=config["quota"]["default_soft"],
+    quota_hard_gb=config["quota"]["default_hard"]
+)
+samba_controller = SambaController(config["storage"]["sessions_path"])
+nemo_sync = NemoSync(
+    api_client=nemo_client,
+    db=state_db,
+    user_provisioner=user_provisioner,
+    on_deactivation=config["sync"]["on_deactivation"],
+    poll_interval=config["nemo"]["poll_interval_seconds"],
+    dry_run=config["sync"]["dry_run"]
+)
 
 # ---------------------------------------------------------------------------
 # Low-level mount helpers (no shell=True)
@@ -151,7 +179,6 @@ session_manager = SessionStateManager(config["session"]["db_path"])
 
 _libc_name = ctypes.util.find_library("c")
 if _libc_name is None:
-    # Fallback to load on non-Unix environments (for tests)
     log.warning("Could not locate libc (might be on non-Unix system)")
     _libc = None
 else:
@@ -164,7 +191,7 @@ MS_REMOUNT = 32
 
 def _mount_bind(source: Path, target: Path) -> None:
     """Create a bind mount using mount(2) syscall."""
-    target.parent.mkdir(parents=True, exist_ok=True)
+    target.mkdir(parents=True, exist_ok=True)
     
     if not _libc:
         log.warning(f"Mocking Bind Mount: {source} → {target}")
@@ -184,7 +211,7 @@ def _mount_bind(source: Path, target: Path) -> None:
 
 def _mount_bind_ro(source: Path, target: Path) -> None:
     """Create a read-only bind mount using mount(2) syscall."""
-    target.parent.mkdir(parents=True, exist_ok=True)
+    target.mkdir(parents=True, exist_ok=True)
     
     if not _libc:
         log.warning(f"Mocking RO Bind Mount: {source} → {target}")
@@ -228,7 +255,14 @@ def _umount(target: Path) -> None:
 
 
 def _is_mountpoint(path: Path) -> bool:
-    """Check if path is a mount point."""
+    """
+    Check if path is an active mount point by reading /proc/self/mountinfo.
+
+    /proc/self/mountinfo encodes special characters (e.g. spaces) as octal
+    escape sequences like \\040. We must decode those before comparing against
+    the resolved filesystem path, otherwise paths containing spaces will never
+    match and graceful_unmount will silently skip the actual umount call.
+    """
     if not path.exists():
         return False
     try:
@@ -237,12 +271,14 @@ def _is_mountpoint(path: Path) -> bool:
             with open("/proc/self/mountinfo", "r") as f:
                 for line in f:
                     parts = line.strip().split()
-                    if len(parts) > 4 and parts[4] == target_path:
-                        return True
+                    if len(parts) > 4:
+                        # Decode octal escapes: \040 → space, \011 → tab, etc.
+                        mount_point = parts[4].replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\")
+                        if mount_point == target_path:
+                            return True
         else:
-            # Fallback/mock check for tests
             return os.path.isdir(path)
-    except OSError:
+    except Exception:
         pass
     return False
 
@@ -265,7 +301,6 @@ def check_open_files(dir_path: Path) -> list:
                     open_files.append(f"PID {parts[1]} ({parts[0]}): {parts[8]}")
             return open_files
     except FileNotFoundError:
-        # lsof not installed, fallback
         pass
     except Exception as e:
         log.debug(f"Error checking open files: {e}")
@@ -313,9 +348,29 @@ def graceful_unmount(target: Path, grace_seconds: int) -> bool:
 # Request validation & HMAC verification
 # ---------------------------------------------------------------------------
 
-def verify_hmac(user: str, tool: str):
+
+def _safe_name(name: str) -> str:
+    """
+    Sanitize a NEMO account/project name for use as a filesystem directory name.
+    Strips leading/trailing whitespace, replaces path-separator characters with '_',
+    and collapses runs of spaces to single spaces so the name looks clean on Windows.
+    """
+    import re
+    if not name:
+        return name
+    # Replace characters that are illegal on Linux or Windows filesystems
+    name = re.sub(r'[/\\:\*\?"<>\|]', '_', name)
+    # Collapse multiple spaces to one and strip edges
+    name = re.sub(r' +', ' ', name).strip()
+    return name
+
+
+def verify_hmac(user_id_str: str, tool: str, account_id_str: str = "", project_id_str: str = ""):
     """
     Verify the HMAC-SHA256 signature in request headers.
+    Message format: {user_id}{tool}{account_id}{project_id}{timestamp}
+    account_id and project_id are included when non-empty so the signature
+    is bound to the exact project being mounted/unmounted.
     Returns (Response, status_code) on failure, or None on success.
     """
     signature = request.headers.get("X-Signature")
@@ -336,7 +391,7 @@ def verify_hmac(user: str, tool: str):
         log.warning(f"🔐 HMAC verification failed: Expired timestamp {timestamp_val} (diff: {abs(current_time - timestamp_val)}s)")
         return jsonify({"error": "Request timestamp expired or invalid"}), 401
 
-    message = f"{user}{tool}{timestamp}"
+    message = f"{user_id_str}{tool}{account_id_str}{project_id_str}{timestamp}"
     expected_sig = hmac.new(SECRET_KEY, message.encode("utf-8"), hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(expected_sig, signature):
@@ -347,25 +402,45 @@ def verify_hmac(user: str, tool: str):
 
 
 def _validate_request():
+    """
+    Parse and validate the incoming JSON request body.
+    Requires: user_id, tool, account_id, project_id.
+    Returns (data_dict, None) on success, or (None, (error_dict, status)) on failure.
+    """
     data = request.get_json(silent=True)
     if data is None:
         return None, ({"error": "Invalid JSON"}, 400)
 
-    user = data.get("user", "").strip()
+    user_id = data.get("user_id")
     tool = data.get("tool", "").strip()
-    group = data.get("group", "").strip() if "group" in data else None
+    account_id = data.get("account_id")
+    project_id = data.get("project_id")
 
-    if not user or not tool:
-        return None, ({"error": "'user' and 'tool' required"}, 400)
+    if user_id is None or not tool:
+        return None, ({"error": "'user_id' and 'tool' required"}, 400)
 
-    for name in (user, tool):
+    if account_id is None or project_id is None:
+        return None, ({"error": "'account_id' and 'project_id' required"}, 400)
+
+    try:
+        user_id_str = str(user_id).strip()
+        account_id_int = int(account_id)
+        project_id_int = int(project_id)
+    except Exception:
+        return None, ({"error": "Invalid ID format — user_id, account_id, project_id must be integers"}, 400)
+
+    for name in (user_id_str, tool):
         if "/" in name or "\\" in name or name in (".", ".."):
-            return None, ({"error": "Invalid characters"}, 400)
+            return None, ({"error": "Invalid characters in user_id or tool"}, 400)
 
-    if group and ("/" in group or "\\" in group or group in (".", "..")):
-        return None, ({"error": "Invalid characters in group"}, 400)
-
-    return data, None
+    return {
+        "user_id": user_id,
+        "user_id_str": user_id_str,
+        "tool": tool,
+        "account_id": account_id_int,
+        "project_id": project_id_int,
+        "session_id": data.get("session_id")
+    }, None
 
 # ---------------------------------------------------------------------------
 # Flask App & Endpoints
@@ -380,120 +455,144 @@ def mount_endpoint():
     if err:
         return jsonify(err[0]), err[1]
 
-    user = data["user"]
+    user_id = data["user_id"]
+    user_id_str = data["user_id_str"]
     tool = data["tool"]
-    group = data.get("group")
-    session_id = data.get("session_id", f"session_{user}_{tool}")
+    account_id = data["account_id"]
+    project_id = data["project_id"]
+    session_id = data.get("session_id") or f"session_{user_id}_{tool}"
 
-    auth_err = verify_hmac(user, tool)
+    auth_err = verify_hmac(user_id_str, tool, str(account_id), str(project_id))
     if auth_err:
         return auth_err
 
-    # Log the user action prominently
-    log.info(f"🔐 USER ACTION: {user} logging into {tool}")
+    log.info(f"🔐 USER ACTION: User ID {user_id} logging into {tool} (project {project_id} / account {account_id})")
 
-    # Fallback to local group mapping if not provided in payload
-    if not group:
-        group = config["group_mapping"].get(user)
+    # Fetch user info from state DB
+    user_info = state_db.get_user_by_id(user_id)
+    if not user_info:
+        # User not synced yet — run an on-demand sync to provision them
+        log.info(f"User ID {user_id} not found in state DB. Running on-demand sync backfill...")
+        nemo_sync.run_once()
+        user_info = state_db.get_user_by_id(user_id)
+        if not user_info:
+            return jsonify({"error": f"User ID {user_id} not found or provisioned on this system"}), 404
 
-    # Check user disk quota before mounting
-    quota_info = quota_manager.check_quota_usage(user, USERS_DIR)
+    username = user_info["username"]
+
+    # Verify user quota usage
+    quota_info = quota_manager.check_quota_usage(f"u{user_id}", str(USERS_DIR))
     quota_warning = None
     if quota_info.get("exceeded"):
-        log.warning(f"⚠️ QUOTA WARNING: User '{user}' has exceeded their disk quota limit! (Used: {quota_info.get('used_gb')}GB)")
+        log.warning(f"⚠️ QUOTA WARNING: User 'u{user_id}' ({username}) exceeded quota! (Used: {quota_info.get('used_gb')}GB)")
         quota_warning = "Quota exceeded!"
 
-    source_user = USERS_DIR / user
-    target_user = SESSIONS_DIR / tool / user
+    # -----------------------------------------------------------------------
+    # Source paths (persistent storage on /srv/labdata)
+    # Source dirs are always keyed by ID (stable even if name changes).
+    # -----------------------------------------------------------------------
+    source_user    = USERS_DIR / f"u{user_id}"
+    source_project = GROUPS_DIR / f"account_{account_id}" / f"project_{project_id}"
 
-    # Create directories
+    # -----------------------------------------------------------------------
+    # Resolve human-readable names from state_db for the session view dirs.
+    # Fall back to "account_{id}" / "project_{id}" if not found in DB yet.
+    # -----------------------------------------------------------------------
+    account_info = state_db.get_account_by_id(account_id)
+    project_info = state_db.get_project_by_id(project_id)
+    account_folder = _safe_name(account_info["name"]) if account_info else f"account_{account_id}"
+    project_folder = _safe_name(project_info["name"]) if project_info else f"project_{project_id}"
+    log.info(f"Session folders: my_groups/{account_folder}/{project_folder}")
+
+    # -----------------------------------------------------------------------
+    # Target paths (ephemeral session view under /tmp/labdata/sessions)
+    # -----------------------------------------------------------------------
+    target_user    = SESSIONS_DIR / tool / "my_files"
+    # Named account+project subfolder — only this project is exposed.
+    target_acc_dir = SESSIONS_DIR / tool / "my_groups" / account_folder
+    target_project = target_acc_dir / project_folder
+    target_public  = SESSIONS_DIR / tool / "public"
+
+    # Ensure source project directory exists (in case sync hasn't run yet)
     try:
         source_user.mkdir(parents=True, exist_ok=True)
+        source_project.mkdir(parents=True, exist_ok=True)
         target_user.mkdir(parents=True, exist_ok=True)
-        if source_user.exists() and source_user.is_dir():
-            log.info(f"📁 User directory ready: {source_user}")
-        else:
-            log.info(f"📁 Created new user directory: {source_user}")
+        target_acc_dir.mkdir(parents=True, exist_ok=True)   # plain dir, not a mount
+        target_project.mkdir(parents=True, exist_ok=True)
+        target_public.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        log.error(f"Failed to create user directories: {exc}")
+        log.error(f"Failed to create mount directories: {exc}")
         return jsonify({"error": str(exc)}), 500
 
-    # Apply default disk quota
-    quota_manager.apply_quota(
-        user,
-        config["quota"]["default_soft"],
-        config["quota"]["default_hard"],
-        USERS_DIR
-    )
+    # -----------------------------------------------------------------------
+    # Provision the tool machine account and grant POSIX ACLs
+    # -----------------------------------------------------------------------
+    tool_machine = user_provisioner.provision_machine_account(tool)
+
+    # User private directory
+    acl_manager.grant_acl_access(tool_machine, str(source_user), "rwx")
+    # Traverse access on the specific account dir only
+    acc_dir = GROUPS_DIR / f"account_{account_id}"
+    acl_manager.grant_acl_access(tool_machine, str(acc_dir), "x")
+    # Full read/write on the specific project dir
+    acl_manager.grant_acl_access(tool_machine, str(source_project), "rwx")
+    # Public directory (read-only)
+    if PUBLIC_DIR.exists() and PUBLIC_DIR.is_dir():
+        acl_manager.grant_acl_access(tool_machine, str(PUBLIC_DIR), "rx")
 
     mount_points = []
 
-    # Perform user bind mount
+    # -----------------------------------------------------------------------
+    # A. User private directory -> my_files/
+    # -----------------------------------------------------------------------
     user_already_mounted = _is_mountpoint(target_user)
     if user_already_mounted:
-        log.info(f"✅ {user} already has active user session mount on {tool}")
+        log.info(f"✅ {username} (u{user_id}) already has active user session mount on {tool}")
     else:
         try:
             _mount_bind(source_user, target_user)
-            log.info(f"✅ MOUNT SUCCESS: {user} → {tool}")
-            log.info(f"   Source: {source_user}")
-            log.info(f"   Target: {target_user}")
+            log.info(f"✅ MOUNT SUCCESS (my_files): u{user_id} → {target_user}")
         except OSError as exc:
-            log.error(f"❌ MOUNT FAILED for {user} on {tool}: {exc}")
+            log.error(f"❌ MOUNT FAILED for user u{user_id} on {tool}: {exc}")
             return jsonify({"error": str(exc)}), 500
-
     mount_points.append(f"{source_user} → {target_user}")
 
-    # Perform group mount if group is specified
-    if group:
-        source_group = GROUPS_DIR / group
-        target_group = SESSIONS_DIR / tool / group
-
+    # -----------------------------------------------------------------------
+    # B. Specific project directory -> my_groups/account_{id}/project_{id}/
+    #    Only the checked-in project is exposed — not the entire groups tree.
+    # -----------------------------------------------------------------------
+    project_already_mounted = _is_mountpoint(target_project)
+    if project_already_mounted:
+        log.info(f"✅ Project {project_id} already mounted on {tool}")
+    else:
         try:
-            source_group.mkdir(parents=True, exist_ok=True)
-            target_group.mkdir(parents=True, exist_ok=True)
+            _mount_bind(source_project, target_project)
+            log.info(f"✅ MOUNT SUCCESS (project): {source_project} → {target_project}")
         except OSError as exc:
-            log.error(f"Failed to create group directories: {exc}")
-        else:
-            # Grant POSIX ACL access
-            acl_manager.grant_group_access(user, source_group)
+            log.error(f"❌ MOUNT FAILED for project {project_id} on {tool}: {exc}")
+            # Non-fatal — continue to mount public
+    mount_points.append(f"{source_project} → {target_project}")
 
-            # Bind mount group directory
-            group_already_mounted = _is_mountpoint(target_group)
-            if group_already_mounted:
-                log.info(f"✅ Group '{group}' already mounted on {tool}")
-            else:
-                try:
-                    _mount_bind(source_group, target_group)
-                    log.info(f"✅ MOUNT SUCCESS (GROUP): {group} → {tool}")
-                    log.info(f"   Source: {source_group}")
-                    log.info(f"   Target: {target_group}")
-                except OSError as exc:
-                    log.error(f"❌ MOUNT FAILED for group {group} on {tool}: {exc}")
-
-            mount_points.append(f"{source_group} → {target_group}")
-
-    # Perform public directory RO mount if it exists
-    if PUBLIC_DIR.exists() and PUBLIC_DIR.is_dir():
-        target_public = SESSIONS_DIR / tool / "public"
+    # -----------------------------------------------------------------------
+    # C. Public directory -> public/ (read-only)
+    # -----------------------------------------------------------------------
+    public_already_mounted = _is_mountpoint(target_public)
+    if not public_already_mounted and PUBLIC_DIR.exists() and PUBLIC_DIR.is_dir():
         try:
-            target_public.mkdir(parents=True, exist_ok=True)
-            public_already_mounted = _is_mountpoint(target_public)
-            if public_already_mounted:
-                log.info(f"✅ Public directory already mounted on {tool}")
-            else:
-                _mount_bind_ro(PUBLIC_DIR, target_public)
-                log.info(f"✅ MOUNT SUCCESS (PUBLIC RO): {PUBLIC_DIR} → {target_public}")
-            mount_points.append(f"{PUBLIC_DIR} → {target_public}")
+            _mount_bind_ro(PUBLIC_DIR, target_public)
+            log.info(f"✅ MOUNT SUCCESS (PUBLIC RO): {PUBLIC_DIR} → {target_public}")
         except Exception as exc:
             log.error(f"❌ MOUNT FAILED for public directory on {tool}: {exc}")
+    mount_points.append(f"{PUBLIC_DIR} → {target_public}")
 
-    # Save session state to database
-    session_manager.save_session(session_id, user, tool, mount_points)
+    # Save session state to SQLite database
+    state_db.save_session(session_id, user_id, tool, mount_points)
 
     response_body = {
         "status": "already_mounted" if user_already_mounted else "mounted",
         "path": str(target_user),
+        "project_path": str(target_project),
         "session_id": session_id
     }
     if quota_warning:
@@ -509,107 +608,108 @@ def unmount_endpoint():
     if err:
         return jsonify(err[0]), err[1]
 
-    user = data["user"]
+    user_id = data["user_id"]
+    user_id_str = data["user_id_str"]
     tool = data["tool"]
+    account_id = data["account_id"]
+    project_id = data["project_id"]
     session_id = data.get("session_id")
 
-    auth_err = verify_hmac(user, tool)
+    auth_err = verify_hmac(user_id_str, tool, str(account_id), str(project_id))
     if auth_err:
         return auth_err
 
-    # Look up session ID in DB if not passed
-    sessions = session_manager.get_all_sessions()
+    log.info(f"🔓 UNMOUNT REQUEST: User ID {user_id} leaving {tool} (project {project_id} / account {account_id})")
+
+    # -----------------------------------------------------------------------
+    # Step 1: Find the matching session in the DB.
+    # NOTE: get_all_sessions() stores the key as "tool" (not "tool_name").
+    # -----------------------------------------------------------------------
+    sessions = state_db.get_all_sessions()
     if not session_id:
         for s_id, s_info in sessions.items():
-            if s_info.get("user") == user and s_info.get("tool") == tool:
+            if s_info.get("user_id") == user_id and s_info.get("tool") == tool:
                 session_id = s_id
                 break
 
     session_info = sessions.get(session_id) if session_id else None
-    mount_points = []
-    group = data.get("group")
 
-    if session_info:
-        mount_points = session_info.get("mount_points", [])
-        if not group:
-            # Try to extract group name from mount points
-            for mp_str in mount_points:
-                if str(GROUPS_DIR) in mp_str:
-                    parts = mp_str.split("→")
-                    if parts:
-                        src_part = parts[0].strip()
-                        group = Path(src_part).name
-                        break
-
-    if not group:
-        group = config["group_mapping"].get(user)
+    # -----------------------------------------------------------------------
+    # Step 2: Determine the tool's session directory and find ALL currently
+    # live mounts under it via /proc/mounts (definitive kernel source of
+    # truth). This way we unmount everything regardless of which project was
+    # mounted — the project in the unmount request might differ from what was
+    # actually mounted if the user switched projects between check-in calls.
+    # -----------------------------------------------------------------------
+    tool_session_dir = SESSIONS_DIR / tool
+    live_mounts = []
+    try:
+        with open("/proc/mounts", "r") as f:
+            for line in f:
+                fields = line.split()
+                if len(fields) >= 2:
+                    mp = fields[1].replace("\\040", " ")
+                    if str(tool_session_dir) in mp:
+                        live_mounts.append(mp)
+        # Deepest paths first so children are unmounted before parents
+        live_mounts.sort(key=len, reverse=True)
+    except Exception as e:
+        log.error(f"Could not read /proc/mounts: {e}")
 
     grace_seconds = config["session"]["unmount_grace_seconds"]
     unmount_success = True
 
-    # Perform unmount for each tracked mount point
-    if mount_points:
-        for mp_str in mount_points:
-            if "→" in mp_str:
-                target_str = mp_str.split("→")[-1].strip()
-                target_path = Path(target_str)
-                
-                log.info(f"Unmounting: {target_path}")
-                if _is_mountpoint(target_path):
-                    if not graceful_unmount(target_path, grace_seconds):
-                        unmount_success = False
-
-                # Remove empty session directory
-                try:
-                    if target_path.exists():
-                        target_path.rmdir()
-                        log.info(f"Removed empty session directory: {target_path}")
-                except OSError as e:
-                    log.warning(f"Could not remove {target_path}: {e}")
-    else:
-        # Fallback to defaults if no DB entry exists
-        target_user = SESSIONS_DIR / tool / user
-        log.info(f"Unmounting (Fallback User): {target_user}")
-        if _is_mountpoint(target_user):
-            if not graceful_unmount(target_user, grace_seconds):
+    if live_mounts:
+        log.info(f"Found {len(live_mounts)} live mount(s) to unmount for tool '{tool}'")
+        for mp in live_mounts:
+            target_path = Path(mp)
+            log.info(f"  Unmounting: {target_path}")
+            if not graceful_unmount(target_path, grace_seconds):
                 unmount_success = False
-        try:
-            if target_user.exists():
-                target_user.rmdir()
-                log.info(f"Removed empty session directory: {target_user}")
-        except OSError as e:
-            log.warning(f"Could not remove {target_user}: {e}")
-
-        if group:
-            target_group = SESSIONS_DIR / tool / group
-            log.info(f"Unmounting (Fallback Group): {target_group}")
-            if _is_mountpoint(target_group):
-                if not graceful_unmount(target_group, grace_seconds):
-                    unmount_success = False
+            # Brief pause so kernel finishes lazy-unmount detach before rmdir
+            time.sleep(0.3)
             try:
-                if target_group.exists():
-                    target_group.rmdir()
-                    log.info(f"Removed empty session directory: {target_group}")
+                if target_path.exists() and not _is_mountpoint(target_path):
+                    target_path.rmdir()
             except OSError as e:
-                log.warning(f"Could not remove {target_group}: {e}")
+                log.warning(f"  Could not remove {target_path}: {e}")
+    else:
+        log.warning(f"No live mounts found in /proc/mounts for tool '{tool}'. Nothing to unmount.")
 
-    # Remove empty tool directory
-    tool_dir = SESSIONS_DIR / tool
-    try:
-        if tool_dir.exists() and not os.listdir(tool_dir):
-            tool_dir.rmdir()
-            log.info(f"Removed empty tool directory: {tool_dir}")
-    except OSError:
-        pass
+    # -----------------------------------------------------------------------
+    # Step 3: Clean up empty leftover dirs (account dir, my_groups, tool dir)
+    # -----------------------------------------------------------------------
+    def _rmdir_if_empty(path: Path):
+        try:
+            if path.exists() and not _is_mountpoint(path) and not list(path.iterdir()):
+                path.rmdir()
+                log.info(f"  Removed empty dir: {path}")
+        except OSError:
+            pass
 
-    # Revoke group ACL permissions if group was associated
-    if group:
-        source_group = GROUPS_DIR / group
-        acl_manager.revoke_group_access(user, source_group)
+    if tool_session_dir.exists():
+        for dirpath, dirnames, filenames in os.walk(str(tool_session_dir), topdown=False):
+            _rmdir_if_empty(Path(dirpath))
+        _rmdir_if_empty(tool_session_dir)
 
-    # Remove session state from database
+    # -----------------------------------------------------------------------
+    # Step 4: Revoke POSIX ACLs for the specific project
+    # -----------------------------------------------------------------------
+    tool_machine   = f"{tool.lower()}_machine"
+    source_user    = USERS_DIR / f"u{user_id}"
+    source_project = GROUPS_DIR / f"account_{account_id}" / f"project_{project_id}"
+    acc_dir        = GROUPS_DIR / f"account_{account_id}"
+
+    acl_manager.revoke_acl_access(tool_machine, str(source_user))
+    acl_manager.revoke_acl_access(tool_machine, str(source_project))
+    acl_manager.revoke_acl_access(tool_machine, str(acc_dir))
+    acl_manager.revoke_acl_access(tool_machine, str(PUBLIC_DIR))
+
+    # -----------------------------------------------------------------------
+    # Step 5: Remove session from DB
+    # -----------------------------------------------------------------------
     if session_id:
-        session_manager.remove_session(session_id)
+        state_db.remove_session(session_id)
 
     if unmount_success:
         return jsonify({"status": "unmounted"}), 200
@@ -623,47 +723,46 @@ def init_user_endpoint():
     if data is None:
         return jsonify({"error": "Invalid JSON"}), 400
 
-    user = data.get("user", "").strip()
+    user_id = data.get("user_id")
     tool = data.get("tool", "system").strip()
 
-    if not user:
-        return jsonify({"error": "'user' required"}), 400
+    if user_id is None:
+        return jsonify({"error": "'user_id' required"}), 400
 
-    for name in (user, tool):
-        if "/" in name or "\\" in name or name in (".", ".."):
-            return jsonify({"error": "Invalid characters"}), 400
+    try:
+        user_id_str = str(user_id).strip()
+    except Exception:
+         return jsonify({"error": "Invalid user_id format"}), 400
 
-    auth_err = verify_hmac(user, tool)
+    auth_err = verify_hmac(user_id_str, tool)
     if auth_err:
         return auth_err
 
-    log.info(f"🔐 USER INITIALIZATION: {user}")
+    log.info(f"🔐 USER INITIALIZATION REQUEST: User ID {user_id}")
 
-    source_user = USERS_DIR / user
+    # Provision user locally
+    user_info = state_db.get_user_by_id(user_id)
+    if not user_info:
+        # Run sync once to load new user data
+        log.info(f"User ID {user_id} not found in state DB. Triggering sync loop...")
+        nemo_sync.run_once()
+        user_info = state_db.get_user_by_id(user_id)
+        
+    # If still not found (e.g. user created in Nextcloud flow but not synced to NEMO yet), provision manually
+    if not user_info:
+        # Fallback creation
+        linux_user = f"u{user_id}"
+        user_provisioner.provision_user(user_id, f"user_{user_id}")
+    else:
+        linux_user = f"u{user_id}"
+        user_provisioner.provision_user(user_id, user_info["username"])
 
-    try:
-        if not source_user.exists():
-            source_user.mkdir(parents=True, exist_ok=True)
-            log.info(f"📁 Initialized storage directory for user: {source_user}")
-            status = "initialized"
-        else:
-            log.info(f"📁 User storage directory already exists: {source_user}")
-            status = "already_exists"
-    except OSError as exc:
-        log.error(f"Failed to create user directory: {exc}")
-        return jsonify({"error": str(exc)}), 500
-
-    # Apply default disk quota
-    quota_manager.apply_quota(
-        user,
-        config["quota"]["default_soft"],
-        config["quota"]["default_hard"],
-        USERS_DIR
-    )
+    user_dir_path = user_provisioner.ensure_user_directory(user_id)
+    user_provisioner.apply_user_quota(user_id)
 
     return jsonify({
-        "status": status,
-        "path": str(source_user)
+        "status": "initialized",
+        "path": user_dir_path
     }), 200
 
 
@@ -672,15 +771,36 @@ def get_sessions():
     """
     Returns all active sessions in the database.
     """
-    return jsonify(session_manager.get_all_sessions()), 200
+    return jsonify(state_db.get_all_sessions()), 200
 
 
-@app.route("/quota/<username>", methods=["GET"])
-def get_user_quota(username):
+@app.route("/projects/<int:user_id>", methods=["GET"])
+def get_user_projects(user_id):
+    """
+    Returns list of active projects for user.
+    """
+    return jsonify(state_db.get_project_linux_groups(user_id)), 200
+
+
+@app.route("/quota/<username_or_id>", methods=["GET"])
+def get_user_quota(username_or_id):
     """
     Queries and returns quota limits and usage for the user.
+    Supports username (e.g., nextcloud_student) or ID (e.g., 9 or u9).
     """
-    quota_info = quota_manager.check_quota_usage(username, USERS_DIR)
+    username = username_or_id
+    if username.startswith("u") and username[1:].isdigit():
+        user_id = int(username[1:])
+    elif username.isdigit():
+        user_id = int(username)
+    else:
+        user_info = state_db.get_user_by_username(username)
+        user_id = user_info["id"] if user_info else None
+
+    if user_id is None:
+        return jsonify({"status": "unknown", "error": "User not found"}), 404
+
+    quota_info = quota_manager.check_quota_usage(f"u{user_id}", str(USERS_DIR))
     return jsonify(quota_info), 200
 
 
@@ -688,59 +808,17 @@ def get_user_quota(username):
 def health():
     return jsonify({"status": "ok"}), 200
 
-
-@app.route("/files/<user>", methods=["GET"])
-def list_files(user):
-    if "/" in user or "\\" in user or user in (".", ".."):
-        return jsonify({"error": "Invalid user name"}), 400
-    
-    user_dir = USERS_DIR / user
-    if not user_dir.exists() or not user_dir.is_dir():
-        return jsonify({"error": f"User directory for {user} does not exist"}), 404
-        
-    try:
-        files = [f for f in os.listdir(user_dir) if os.path.isfile(user_dir / f)]
-    except Exception as e:
-        return jsonify({"error": f"Failed to list files: {str(e)}"}), 500
-        
-    html = f"<html><head><title>Files for {user}</title></head><body>"
-    html += f"<h1>Files for {user}</h1>"
-    if not files:
-        html += "<p>No files found.</p>"
-    else:
-        html += "<ul>"
-        for f in files:
-            html += f'<li><a href="/download/{user}/{f}">{f}</a></li>'
-        html += "</ul>"
-    html += "</body></html>"
-    return html
-
-
-@app.route("/download/<user>/<filename>", methods=["GET"])
-def download_file(user, filename):
-    if "/" in user or "\\" in user or user in (".", ".."):
-        return jsonify({"error": "Invalid user name"}), 400
-    if "/" in filename or "\\" in filename or filename in (".", ".."):
-        return jsonify({"error": "Invalid filename"}), 400
-        
-    user_dir = USERS_DIR / user
-    if not user_dir.exists() or not user_dir.is_dir():
-        return jsonify({"error": f"User directory for {user} does not exist"}), 404
-        
-    return send_from_directory(user_dir, filename)
-
 # ---------------------------------------------------------------------------
 # Auto-unmount Callback for Idle Session Monitor
 # ---------------------------------------------------------------------------
 
-def auto_unmount_session(user, tool, session_id):
+def auto_unmount_session(user_id, tool, session_id):
     """
     Function triggered by IdleMonitor background thread to clean up idle sessions.
     """
-    log.info(f"⏳ Auto-unmount: Triggered for user '{user}' on tool '{tool}' (Session: {session_id})")
+    log.info(f"⏳ Auto-unmount: Triggered for user ID '{user_id}' on tool '{tool}' (Session: {session_id})")
     
-    sessions = session_manager.get_all_sessions()
-    session_info = sessions.get(session_id)
+    session_info = state_db.get_session(session_id)
     if not session_info:
         log.warning(f"⏳ Auto-unmount: Session {session_id} not found in database.")
         return
@@ -760,7 +838,6 @@ def auto_unmount_session(user, tool, session_id):
             try:
                 if target_path.exists():
                     target_path.rmdir()
-                    log.info(f"Removed empty session directory: {target_path}")
             except OSError as e:
                 log.warning(f"Could not remove {target_path}: {e}")
 
@@ -773,22 +850,25 @@ def auto_unmount_session(user, tool, session_id):
     except OSError:
         pass
 
-    # Revoke group ACL permissions if group was associated
-    group = None
-    for mp_str in mount_points:
-        if str(GROUPS_DIR) in mp_str:
-            parts = mp_str.split("→")
-            if parts:
-                src_part = parts[0].strip()
-                group = Path(src_part).name
-                break
+    # Revoke machine account ACL permissions
+    tool_machine = f"{tool.lower()}_machine"
+    source_user = USERS_DIR / f"u{user_id}"
+    acl_manager.revoke_acl_access(tool_machine, str(source_user))
     
-    if group:
-        source_group = GROUPS_DIR / group
-        acl_manager.revoke_group_access(user, source_group)
+    projects = state_db.get_project_linux_groups(user_id)
+    for proj in projects:
+        acc_id = proj["account_id"]
+        proj_id = proj["id"]
+        acc_dir = GROUPS_DIR / f"account_{acc_id}"
+        proj_dir = acc_dir / f"project_{proj_id}"
+        acl_manager.revoke_acl_access(tool_machine, str(proj_dir))
+        acl_manager.revoke_acl_access(tool_machine, str(acc_dir))
+        
+    acl_manager.revoke_acl_access(tool_machine, str(GROUPS_DIR))
+    acl_manager.revoke_acl_access(tool_machine, str(PUBLIC_DIR))
 
     # Clean up from database
-    session_manager.remove_session(session_id)
+    state_db.remove_session(session_id)
     log.info(f"⏳ Auto-unmount complete: Session '{session_id}' unmounted successfully")
 
 # ---------------------------------------------------------------------------
@@ -831,15 +911,12 @@ def recover_orphans(session_mgr, sessions_dir: Path):
         if mp not in active_targets:
             log.warning(f"🧹 Orphan recovery: Found orphaned mount point '{mp}'")
             try:
-                # Lazy unmount
                 subprocess.run(["umount", "-l", mp], check=True, capture_output=True)
                 log.info(f"🧹 Orphan recovery: Successfully unmounted '{mp}'")
                 orphans_cleaned += 1
                 
-                # Try to clean up directory
                 try:
                     os.rmdir(mp)
-                    log.info(f"🧹 Orphan recovery: Removed empty session directory '{mp}'")
                 except Exception:
                     pass
             except Exception as e:
@@ -851,24 +928,78 @@ def recover_orphans(session_mgr, sessions_dir: Path):
 # Main Entry Point
 # ---------------------------------------------------------------------------
 
+def startup_cleanup():
+    """
+    On every daemon start, force-unmount ALL bind mounts under SESSIONS_DIR
+    and wipe the session state from the DB.
+
+    Why: Linux bind mounts are kernel-level and survive daemon restarts.
+    Without this, stale Microscope1/Litho1 folders keep showing up in the
+    Samba share even when no one is using those tools.
+
+    After cleanup, active NEMO sessions will re-trigger mounts the next
+    time a user logs into a tool.
+    """
+    log.info("🧹 STARTUP CLEANUP: Wiping all stale session mounts...")
+
+    stale_mounts = []
+    # 1. Find every labdata session mount currently active in the kernel.
+    #    Use /proc/mounts (space-separated, field 1 is the mount point) rather
+    #    than `mount` command output, which breaks on paths containing spaces.
+    try:
+        with open("/proc/mounts", "r") as f:
+            for line in f:
+                fields = line.split()
+                if len(fields) >= 2:
+                    mount_point = fields[1]
+                    # /proc/mounts encodes spaces as \040
+                    mount_point = mount_point.replace("\\040", " ")
+                    if str(SESSIONS_DIR) in mount_point:
+                        stale_mounts.append(mount_point)
+
+        # Unmount deepest paths first (longest path = deepest child first)
+        stale_mounts.sort(key=len, reverse=True)
+        for mp in stale_mounts:
+            log.info(f"  Unmounting stale: {mp}")
+            subprocess.run(["umount", "-l", mp], capture_output=True)
+    except Exception as e:
+        log.error(f"Startup cleanup: error scanning /proc/mounts: {e}")
+
+    # 2. Remove and recreate the sessions directory so the Samba share is empty
+    try:
+        import shutil
+        shutil.rmtree(str(SESSIONS_DIR), ignore_errors=True)
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        log.info(f"  Session directory wiped and recreated: {SESSIONS_DIR}")
+    except Exception as e:
+        log.error(f"Startup cleanup: error wiping sessions dir: {e}")
+
+    # 3. Clear stale sessions from SQLite
+    cleared = state_db.clear_all_sessions()
+    log.info(f"🧹 STARTUP CLEANUP DONE: {len(stale_mounts) if 'stale_mounts' in dir() else 0} mounts removed, {cleared} DB sessions cleared.")
+
+
 if __name__ == "__main__":
     if os.name != 'nt' and os.geteuid() != 0:
         log.warning("Not running as root — mounts and ACLs will fail! Run with sudo")
-    
-    # Ensure base storage and session directories exist
+
+    # Ensure base storage directories exist (NOT sessions — startup_cleanup recreates it)
     USERS_DIR.mkdir(parents=True, exist_ok=True)
     GROUPS_DIR.mkdir(parents=True, exist_ok=True)
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Run orphan recovery
-    recover_orphans(session_manager, SESSIONS_DIR)
+
+    # Wipe all stale mounts and session state on every start
+    startup_cleanup()
+
+    # Start NEMO Sync scheduler
+    nemo_sync.start()
 
     # Start idle session monitor background thread
     idle_monitor = IdleMonitor(
-        session_manager=session_manager,
+        session_manager=state_db,
         unmount_callback=auto_unmount_session,
         idle_timeout_minutes=config["session"]["idle_timeout_minutes"],
-        check_interval_seconds=30  # Poll every 30 seconds for active testing
+        check_interval_seconds=30,
+        samba_controller=samba_controller
     )
     idle_monitor.start()
 
@@ -876,8 +1007,9 @@ if __name__ == "__main__":
     log.info(f"Users directory: {USERS_DIR}")
     log.info(f"Groups directory: {GROUPS_DIR}")
     log.info(f"Sessions directory: {SESSIONS_DIR}")
-    
+
     try:
         app.run(host=HOST, port=PORT, debug=False)
     finally:
+        nemo_sync.stop()
         idle_monitor.stop()

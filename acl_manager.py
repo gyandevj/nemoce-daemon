@@ -4,48 +4,56 @@ from pathlib import Path
 
 logger = logging.getLogger("lab-daemon")
 
-def grant_group_access(username: str, group_dir: str) -> bool:
+def grant_acl_access(username: str, path: str, permissions: str = "rwx") -> bool:
     """
-    Grants read, write, execute (rwx) access to the specified user on the group directory
-    using: setfacl -m u:username:rwx group_dir
+    Grants specific ACL permissions to a user or machine account on a target directory.
+    using: setfacl -m u:username:permissions path
     """
-    group_dir_str = str(Path(group_dir).resolve())
+    resolved_path = str(Path(path).resolve())
     try:
-        cmd = ["setfacl", "-m", f"u:{username}:rwx", group_dir_str]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        logger.info(f"🔑 ACL: Granted rwx access to user '{username}' on '{group_dir_str}'")
+        cmd = ["setfacl", "-m", f"u:{username}:{permissions}", resolved_path]
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        logger.info(f"🔑 ACL: Granted '{permissions}' access to '{username}' on '{resolved_path}'")
         return True
     except FileNotFoundError:
-        logger.warning(f"⚠️ ACL Warning: 'setfacl' executable not found. Cannot set ACLs on '{group_dir_str}'.")
+        logger.warning(f"⚠️ ACL Warning: 'setfacl' executable not found. Cannot set ACLs on '{resolved_path}'.")
         return False
     except subprocess.CalledProcessError as e:
-        logger.error(f"❌ ACL Error: Failed to grant access to user '{username}' on '{group_dir_str}': {e.stderr.strip()}")
+        logger.error(f"❌ ACL Error: Failed to grant access to '{username}' on '{resolved_path}': {e.stderr.strip()}")
         return False
     except Exception as e:
         logger.error(f"❌ ACL Error: Unexpected error: {e}")
         return False
 
-def revoke_group_access(username: str, group_dir: str) -> bool:
+def revoke_acl_access(username: str, path: str) -> bool:
     """
-    Revokes access for the specified user from the group directory
-    using: setfacl -x u:username group_dir
+    Revokes ACL permissions for a user or machine account from a target directory.
+    using: setfacl -x u:username path
     """
-    group_dir_str = str(Path(group_dir).resolve())
+    resolved_path = str(Path(path).resolve())
     try:
-        cmd = ["setfacl", "-x", f"u:{username}", group_dir_str]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        logger.info(f"🔑 ACL: Revoked access for user '{username}' from '{group_dir_str}'")
+        cmd = ["setfacl", "-x", f"u:{username}", resolved_path]
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        logger.info(f"🔑 ACL: Revoked access for '{username}' from '{resolved_path}'")
         return True
     except FileNotFoundError:
-        logger.warning(f"⚠️ ACL Warning: 'setfacl' executable not found. Cannot revoke ACLs on '{group_dir_str}'.")
+        logger.warning(f"⚠️ ACL Warning: 'setfacl' executable not found. Cannot revoke ACLs on '{resolved_path}'.")
         return False
     except subprocess.CalledProcessError as e:
         # Ignore errors if the entry doesn't exist, which can happen if it was already cleared
         if "no such entry" in e.stderr.lower():
-            logger.info(f"🔑 ACL: User '{username}' already had no ACL entry on '{group_dir_str}'")
+            logger.info(f"🔑 ACL: '{username}' already had no ACL entry on '{resolved_path}'")
             return True
-        logger.error(f"❌ ACL Error: Failed to revoke access for user '{username}' from '{group_dir_str}': {e.stderr.strip()}")
+        logger.error(f"❌ ACL Error: Failed to revoke access for '{username}' from '{resolved_path}': {e.stderr.strip()}")
         return False
     except Exception as e:
         logger.error(f"❌ ACL Error: Unexpected error: {e}")
         return False
+
+def grant_group_access(username: str, group_dir: str) -> bool:
+    """Backward compatibility wrapper"""
+    return grant_acl_access(username, group_dir, "rwx")
+
+def revoke_group_access(username: str, group_dir: str) -> bool:
+    """Backward compatibility wrapper"""
+    return revoke_acl_access(username, group_dir)
