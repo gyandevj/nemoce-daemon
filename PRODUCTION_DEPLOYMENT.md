@@ -51,6 +51,9 @@ sudo apt install -y redis-server php-redis
 *   **mariadb-server**: Relational database. Acts as the primary backend database for Nextcloud.
 *   **php-fpm (and modules)**: The PHP fast process manager and dependencies required to execute the Nextcloud web app.
 *   **redis-server, php-redis**: In-memory caching server. Speeds up Nextcloud sessions and prevents file-lock database collisions.
+*   **Nextcloud Server**: The open-source portal software that users log into to view and download their files.
+*   **Nextcloud User SAML Backend (user_saml)**: Nextcloud application plugin that connects logins to Princeton's Shibboleth SSO.
+*   **Nextcloud External Storage Support (files_external)**: Nextcloud application plugin that dynamically mounts Linux user/group storage paths.
 
 ---
 
