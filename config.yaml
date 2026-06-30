@@ -4,6 +4,17 @@ storage:
   groups_path: "/tmp/labdata/groups"
   sessions_path: "/tmp/labdata/sessions"
   public_path: "/tmp/labdata/public"
+  # group_folder_type determines whether the groups folder in the Samba share
+  # exposes accounts, projects, or nested hierarchical folders at the top level.
+  # Options: "project" (default), "account", or "hierarchical".
+  # This choice is locked at initial deployment.
+  group_folder_type: "hierarchical"
+
+mtls:
+  enabled: true
+  ca_cert: "certs/ca.crt"
+  server_cert: "certs/server.crt"
+  server_key: "certs/server.key"
 
 quota:
   default_soft: 10  # GB

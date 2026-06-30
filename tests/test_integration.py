@@ -24,6 +24,7 @@ storage:
   groups_path: "{tempfile.gettempdir()}/labdata/groups"
   sessions_path: "{tempfile.gettempdir()}/labdata/sessions"
   public_path: "{tempfile.gettempdir()}/labdata/public"
+  group_folder_type: "hierarchical"
 
 quota:
   default_soft: 10
@@ -41,6 +42,12 @@ nemo:
 sync:
   on_deactivation: "lock_account"
   dry_run: true
+
+mtls:
+  enabled: true
+  ca_cert: "certs/ca.crt"
+  server_cert: "certs/server.crt"
+  server_key: "certs/server.key"
 """
 
 with open(temp_config_path, "w") as f:
@@ -112,18 +119,9 @@ class TestIntegration(unittest.TestCase):
         except OSError:
             pass
 
-    def _generate_headers(self, user_id_str, tool):
-        timestamp = str(int(time.time()))
-        message = f"{user_id_str}{tool}{timestamp}"
-        signature = hmac.new(
-            daemon.SECRET_KEY,
-            message.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-        
+    def _generate_headers(self, success=True):
         return {
-            'X-Timestamp': timestamp,
-            'X-Signature': signature,
+            'X-Client-Verify': 'SUCCESS' if success else 'NONE',
             'Content-Type': 'application/json'
         }
 
@@ -138,12 +136,13 @@ class TestIntegration(unittest.TestCase):
 
         tool = "microscope1"
         user_id = 146
-        user_id_str = "146"
+        account_id = 20
+        project_id = 426
         session_id = f"session_{user_id}_{tool}"
 
         # 1. Test Mount Endpoint
-        headers = self._generate_headers(user_id_str, tool)
-        payload = {"user_id": user_id, "tool": tool}
+        headers = self._generate_headers(success=True)
+        payload = {"user_id": user_id, "tool": tool, "account_id": account_id, "project_id": project_id}
         
         resp = self.app.post("/mount", data=json.dumps(payload), headers=headers)
         self.assertEqual(resp.status_code, 201)
@@ -164,8 +163,8 @@ class TestIntegration(unittest.TestCase):
         self.assertIn(session_id, data)
 
         # 3. Test Unmount Endpoint
-        headers = self._generate_headers(user_id_str, tool)
-        payload = {"user_id": user_id, "tool": tool, "session_id": session_id}
+        headers = self._generate_headers(success=True)
+        payload = {"user_id": user_id, "tool": tool, "session_id": session_id, "account_id": account_id, "project_id": project_id}
         
         resp = self.app.post("/unmount", data=json.dumps(payload), headers=headers)
         self.assertEqual(resp.status_code, 200)
@@ -182,8 +181,7 @@ class TestIntegration(unittest.TestCase):
         mock_dir.return_value = "/srv/labdata/users/u146"
         
         user_id = 146
-        user_id_str = "146"
-        headers = self._generate_headers(user_id_str, "system")
+        headers = self._generate_headers(success=True)
         payload = {"user_id": user_id}
         
         resp = self.app.post("/init_user", data=json.dumps(payload), headers=headers)
@@ -191,6 +189,22 @@ class TestIntegration(unittest.TestCase):
         data = json.loads(resp.data)
         self.assertEqual(data["status"], "initialized")
         self.assertEqual(data["path"], "/srv/labdata/users/u146")
+
+    def test_unauthorized_access(self):
+        headers = self._generate_headers(success=False)
+        payload = {"user_id": 146, "tool": "microscope1", "account_id": 20, "project_id": 426}
+        
+        # Test mount
+        resp = self.app.post("/mount", data=json.dumps(payload), headers=headers)
+        self.assertEqual(resp.status_code, 401)
+        
+        # Test unmount
+        resp = self.app.post("/unmount", data=json.dumps(payload), headers=headers)
+        self.assertEqual(resp.status_code, 401)
+        
+        # Test init_user
+        resp = self.app.post("/init_user", data=json.dumps({"user_id": 146}), headers=headers)
+        self.assertEqual(resp.status_code, 401)
 
 
 if __name__ == "__main__":

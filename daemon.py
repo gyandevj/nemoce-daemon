@@ -92,7 +92,8 @@ DEFAULT_CONFIG = {
         "users_path": "/srv/labdata/users",
         "groups_path": "/srv/labdata/groups",
         "sessions_path": "/tmp/labdata/sessions",
-        "public_path": "/srv/labdata/public"
+        "public_path": "/srv/labdata/public",
+        "group_folder_type": "project"  # project | account | hierarchical
     },
     "quota": {
         "default_soft": 10,  # GB
@@ -110,6 +111,12 @@ DEFAULT_CONFIG = {
     "sync": {
         "on_deactivation": "lock_account",
         "dry_run": False
+    },
+    "mtls": {
+        "enabled": False,
+        "ca_cert": "certs/ca.crt",
+        "server_cert": "certs/server.crt",
+        "server_key": "certs/server.key"
     }
 }
 
@@ -130,7 +137,7 @@ for loc in config_locations:
                 loaded = yaml.safe_load(f)
                 if loaded:
                     # Deep merge configuration
-                    for section in ["storage", "quota", "session", "nemo", "sync"]:
+                    for section in ["storage", "quota", "session", "nemo", "sync", "mtls"]:
                         if section in loaded and isinstance(loaded[section], dict):
                             config[section].update(loaded[section])
             log.info(f"Loaded configuration from: {loc}")
@@ -365,40 +372,21 @@ def _safe_name(name: str) -> str:
     return name
 
 
-def verify_hmac(user_id_str: str, tool: str, account_id_str: str = "", project_id_str: str = ""):
+def verify_client_auth() -> bool:
     """
-    Verify the HMAC-SHA256 signature in request headers.
-    Message format: {user_id}{tool}{account_id}{project_id}{timestamp}
-    account_id and project_id are included when non-empty so the signature
-    is bound to the exact project being mounted/unmounted.
-    Returns (Response, status_code) on failure, or None on success.
+    Verify Mutual TLS (mTLS) client certificate verification.
+    If behind a reverse proxy (like Nginx), we check the proxy header 'X-Client-Verify'.
+    Otherwise, if native SSL context is active, the SSL handshake enforces client verification,
+    so we return True.
     """
-    signature = request.headers.get("X-Signature")
-    timestamp = request.headers.get("X-Timestamp")
-
-    if not signature or not timestamp:
-        log.warning("🔐 HMAC verification failed: Missing X-Signature or X-Timestamp headers")
-        return jsonify({"error": "Missing HMAC signature or timestamp headers"}), 401
-
-    try:
-        timestamp_val = int(timestamp)
-    except (ValueError, TypeError):
-        log.warning(f"🔐 HMAC verification failed: Invalid timestamp format '{timestamp}'")
-        return jsonify({"error": "Invalid timestamp format"}), 401
-
-    current_time = int(time.time())
-    if abs(current_time - timestamp_val) > 30:
-        log.warning(f"🔐 HMAC verification failed: Expired timestamp {timestamp_val} (diff: {abs(current_time - timestamp_val)}s)")
-        return jsonify({"error": "Request timestamp expired or invalid"}), 401
-
-    message = f"{user_id_str}{tool}{account_id_str}{project_id_str}{timestamp}"
-    expected_sig = hmac.new(SECRET_KEY, message.encode("utf-8"), hashlib.sha256).hexdigest()
-
-    if not hmac.compare_digest(expected_sig, signature):
-        log.warning("🔐 HMAC verification failed: Invalid signature")
-        return jsonify({"error": "Invalid signature"}), 401
-
-    return None
+    client_verify = request.headers.get("X-Client-Verify")
+    if client_verify:
+        if client_verify != "SUCCESS":
+            log.warning(f"🔐 mTLS verification failed: X-Client-Verify is '{client_verify}'")
+            return False
+        return True
+    
+    return True
 
 
 def _validate_request():
@@ -462,9 +450,9 @@ def mount_endpoint():
     project_id = data["project_id"]
     session_id = data.get("session_id") or f"session_{user_id}_{tool}"
 
-    auth_err = verify_hmac(user_id_str, tool, str(account_id), str(project_id))
-    if auth_err:
-        return auth_err
+    if config.get("mtls", {}).get("enabled"):
+        if not verify_client_auth():
+            return jsonify({"error": "Mutual TLS client verification failed"}), 401
 
     log.info(f"🔐 USER ACTION: User ID {user_id} logging into {tool} (project {project_id} / account {account_id})")
 
@@ -496,29 +484,56 @@ def mount_endpoint():
 
     # -----------------------------------------------------------------------
     # Resolve human-readable names from state_db for the session view dirs.
-    # Fall back to "account_{id}" / "project_{id}" if not found in DB yet.
+    # Run an on-demand sync backfill if account/project is missing.
     # -----------------------------------------------------------------------
     account_info = state_db.get_account_by_id(account_id)
     project_info = state_db.get_project_by_id(project_id)
+    if not account_info or not project_info:
+        log.info(f"Account {account_id} or Project {project_id} not found in state DB. Running on-demand sync backfill...")
+        nemo_sync.run_once()
+        account_info = state_db.get_account_by_id(account_id)
+        project_info = state_db.get_project_by_id(project_id)
+
+    # Reject deactivations
+    if user_info and not user_info.get("active", True):
+        log.warning(f"❌ Mount rejected: User 'u{user_id}' is deactivated.")
+        return jsonify({"error": "User is deactivated"}), 403
+
+    if account_info and not account_info.get("active", True):
+        log.warning(f"❌ Mount rejected: Account '{account_info['name']}' is deactivated.")
+        return jsonify({"error": "Account is deactivated"}), 403
+
+    if project_info and not project_info.get("active", True):
+        log.warning(f"❌ Mount rejected: Project '{project_info['name']}' is deactivated.")
+        return jsonify({"error": "Project is deactivated"}), 403
+
     account_folder = _safe_name(account_info["name"]) if account_info else f"account_{account_id}"
     project_folder = _safe_name(project_info["name"]) if project_info else f"project_{project_id}"
-    log.info(f"Session folders: my_groups/{account_folder}/{project_folder}")
 
     # -----------------------------------------------------------------------
     # Target paths (ephemeral session view under /tmp/labdata/sessions)
+    # Determine the folder structure choice locked at deployment time.
     # -----------------------------------------------------------------------
+    group_folder_type = config["storage"].get("group_folder_type", "project")
     target_user    = SESSIONS_DIR / tool / "my_files"
-    # Named account+project subfolder — only this project is exposed.
-    target_acc_dir = SESSIONS_DIR / tool / "my_groups" / account_folder
-    target_project = target_acc_dir / project_folder
     target_public  = SESSIONS_DIR / tool / "public"
+
+    if group_folder_type == "account":
+        target_project = SESSIONS_DIR / tool / "my_groups" / account_folder
+        log.info(f"Session folders: my_groups/{account_folder} (type: account)")
+    elif group_folder_type == "project":
+        target_project = SESSIONS_DIR / tool / "my_groups" / project_folder
+        log.info(f"Session folders: my_groups/{project_folder} (type: project)")
+    else:  # hierarchical
+        target_project = SESSIONS_DIR / tool / "my_groups" / account_folder / project_folder
+        log.info(f"Session folders: my_groups/{account_folder}/{project_folder} (type: hierarchical)")
 
     # Ensure source project directory exists (in case sync hasn't run yet)
     try:
         source_user.mkdir(parents=True, exist_ok=True)
         source_project.mkdir(parents=True, exist_ok=True)
         target_user.mkdir(parents=True, exist_ok=True)
-        target_acc_dir.mkdir(parents=True, exist_ok=True)   # plain dir, not a mount
+        target_project.parent.mkdir(parents=True, exist_ok=True)
         target_project.mkdir(parents=True, exist_ok=True)
         target_public.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -615,9 +630,9 @@ def unmount_endpoint():
     project_id = data["project_id"]
     session_id = data.get("session_id")
 
-    auth_err = verify_hmac(user_id_str, tool, str(account_id), str(project_id))
-    if auth_err:
-        return auth_err
+    if config.get("mtls", {}).get("enabled"):
+        if not verify_client_auth():
+            return jsonify({"error": "Mutual TLS client verification failed"}), 401
 
     log.info(f"🔓 UNMOUNT REQUEST: User ID {user_id} leaving {tool} (project {project_id} / account {account_id})")
 
@@ -734,9 +749,9 @@ def init_user_endpoint():
     except Exception:
          return jsonify({"error": "Invalid user_id format"}), 400
 
-    auth_err = verify_hmac(user_id_str, tool)
-    if auth_err:
-        return auth_err
+    if config.get("mtls", {}).get("enabled"):
+        if not verify_client_auth():
+            return jsonify({"error": "Mutual TLS client verification failed"}), 401
 
     log.info(f"🔐 USER INITIALIZATION REQUEST: User ID {user_id}")
 
@@ -1008,8 +1023,20 @@ if __name__ == "__main__":
     log.info(f"Groups directory: {GROUPS_DIR}")
     log.info(f"Sessions directory: {SESSIONS_DIR}")
 
+    context = None
+    if config.get("mtls", {}).get("enabled"):
+        import ssl
+        mtls_conf = config["mtls"]
+        # Convert relative paths to absolute relative to this file or cwd if needed
+        # We'll expect them to be absolute or correctly situated relative to execution directory
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(mtls_conf["server_cert"], mtls_conf["server_key"])
+        context.load_verify_locations(mtls_conf["ca_cert"])
+        context.verify_mode = ssl.CERT_REQUIRED
+        log.info("🔒 mTLS Client-Certificate Verification is ENABLED")
+
     try:
-        app.run(host=HOST, port=PORT, debug=False)
+        app.run(host=HOST, port=PORT, debug=False, ssl_context=context)
     finally:
         nemo_sync.stop()
         idle_monitor.stop()
