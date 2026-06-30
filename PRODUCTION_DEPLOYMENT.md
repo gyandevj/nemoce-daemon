@@ -38,7 +38,22 @@ sudo apt install -y mariadb-server php-fpm php-mysql php-common php-curl \
 sudo apt install -y redis-server php-redis
 ```
 
+### 🛠️ Required Packages & Utilities
+
+*   **acl**: Linux Access Control Lists utility. Essential for setting dynamic user permissions (`setfacl`) on folders.
+*   **cifs-utils**: Filesystem mount utility. Required to mount the remote 6 TB storage pool onto the VM.
+*   **lsof**: List Open Files utility. The daemon runs this before unmounting to prevent data corruption.
+*   **sqlite3**: Local lightweight database. Used by the daemon to keep track of active sessions.
+*   **python3, python3-pip, python3-venv, python3-dev**: Core Python 3 development runtime and tools used to run the Lab Daemon.
+*   **nginx**: Web server and proxy. Used to terminate secure mTLS client certificates from NEMO and serve Nextcloud.
+*   **openssl**: SSL/TLS library. Used to generate and manage certificates.
+*   **samba, samba-common-bin**: File sharing server. Shares active session folders to lab instrument computers.
+*   **mariadb-server**: Relational database. Acts as the primary backend database for Nextcloud.
+*   **php-fpm (and modules)**: The PHP fast process manager and dependencies required to execute the Nextcloud web app.
+*   **redis-server, php-redis**: In-memory caching server. Speeds up Nextcloud sessions and prevents file-lock database collisions.
+
 ---
+
 
 ## 💾 3. Storage Mount Configuration (6 TB SMB Share)
 
