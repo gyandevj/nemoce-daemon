@@ -196,7 +196,53 @@ To integrate Nextcloud with Princeton’s Web SSO (Shibboleth):
 
 ---
 
-## 🖥️ 7. Samba Configuration (Tool PCs)
+## 🛡️ 7. Nextcloud Upload Security & File Sanitization
+
+Since files uploaded via Nextcloud are accessed directly by Samba on Windows-based Tool PCs, enforcing strict security and sanitization at the upload gateway is critical.
+
+### A. Filename Sanitization (Samba/Windows Compatibility)
+To prevent filename formatting from breaking Samba mounts on Windows Tool PCs, enforce character sanitization in Nextcloud. 
+
+Add the following to `/var/www/nextcloud/config/config.php`:
+```php
+// Prevent Windows-illegal characters in filenames
+'disallowed_extra_characters' => ['\\', '/', '*', '?', ':', '<', '>', '|', '"'],
+```
+
+### B. Malware & Antivirus Scanning (ClamAV Integration)
+Integrate ClamAV on the server to automatically scan every uploaded file in real-time.
+
+1. **Install ClamAV on the VM:**
+   ```bash
+   sudo apt install -y clamav clamav-daemon
+   ```
+2. **Enable ClamAV Daemon:**
+   ```bash
+   sudo systemctl enable clamav-daemon --now
+   ```
+3. **Install Nextcloud Antivirus App:**
+   * Go to **Nextcloud Apps** -> **Security** -> Enable **Antivirus for Files** (`files_antivirus`).
+4. **Configure Nextcloud Antivirus Settings:**
+   * Navigate to **Settings** -> **Security** -> **Antivirus for Files**.
+   * Set **App Mode** to: `Daemon (Socket)`
+   * Set **Socket Path** to: `/var/run/clamav/clamd.ctl`
+   * Set **Action on Infected Files**: `Delete file` or `Block upload`.
+
+### C. Blocking Executables (File Access Control)
+Prevent researchers from uploading executable files (`.exe`, `.bat`, `.sh`) which could be run on Windows instrument PCs.
+
+1. **Enable Nextcloud File Access Control App:**
+   * Enable the **File Access Control** (`files_accesscontrol`) app in the Nextcloud admin panel.
+2. **Configure the Access Rule:**
+   * Navigate to **Settings** -> **Flow** -> **File Access Control**.
+   * Add a new rule:
+     * **Block upload** if:
+       * *File MIME type* matches: `application/x-msdownload` OR
+       * *Filename* matches regex: `/(\.exe|\.bat|\.cmd|\.sh|\.elf|\.bin)$/i`
+
+---
+
+## 🖥️ 8. Samba Configuration (Tool PCs)
 
 Edit `/etc/samba/smb.conf` to expose the active session mount folders to the air-gapped lab computers:
 
@@ -235,7 +281,7 @@ Each instrument computer connects to the file server using a unique local machin
 
 ---
 
-## 🛡️ 8. Permissions & Quota Administration
+## 🛡️ 9. Permissions & Quota Administration
 
 The daemon manages permissions dynamically at runtime:
 
@@ -255,3 +301,4 @@ The daemon manages permissions dynamically at runtime:
   # Allocates group limits to project folder group
   setquota -g proj_{project_id} 50G 60G 0 0 /srv/labdata
   ```
+
