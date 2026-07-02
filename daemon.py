@@ -360,7 +360,8 @@ def _safe_name(name: str) -> str:
     """
     Sanitize a NEMO account/project name for use as a filesystem directory name.
     Strips leading/trailing whitespace, replaces path-separator characters with '_',
-    and collapses runs of spaces to single spaces so the name looks clean on Windows.
+    collapses runs of spaces to single spaces so the name looks clean on Windows,
+    removes trailing periods (illegal on Windows), and handles Windows reserved names.
     """
     import re
     if not name:
@@ -369,7 +370,16 @@ def _safe_name(name: str) -> str:
     name = re.sub(r'[/\\:\*\?"<>\|]', '_', name)
     # Collapse multiple spaces to one and strip edges
     name = re.sub(r' +', ' ', name).strip()
-    return name
+    # Windows folders cannot end with a period
+    name = name.rstrip('.')
+    
+    # Windows reserved filenames (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+    reserved_patterns = re.compile(r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$', re.IGNORECASE)
+    if reserved_patterns.match(name):
+        name = f"_{name}"
+        
+    return name if name else "unnamed_folder"
+
 
 
 def verify_client_auth() -> bool:
