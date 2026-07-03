@@ -38,7 +38,7 @@ nemo:
   poll_interval_seconds: 3600
   use_api_http: false
   api_url: "http://localhost:8000"
-  api_token: "7bcbd57d7c8161e65d458dd8c1ae10d3118c7e98"
+  api_token: "nemo_api_token_here_replace_me"
 
 sync:
   on_deactivation: "lock_account"  # lock_account | remove_membership_only | ignore
