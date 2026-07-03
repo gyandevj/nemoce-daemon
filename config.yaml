@@ -30,6 +30,7 @@ quota:
 
 session:
   db_path: "/var/lib/lab-daemon/state.db"  # SQLite Database
+  socket_path: "/var/run/lab-daemon/lab-daemon.sock"  # Unix Socket
   idle_timeout_minutes: 60
   unmount_grace_seconds: 30
 

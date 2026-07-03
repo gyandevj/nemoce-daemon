@@ -36,17 +36,20 @@ In scientific facilities, users generate massive datasets from instruments (e.g.
 
 ## Solution Overview
 This system provides an end-to-end automated workflow:
-1. **Tool Check-in**: A user checks into a tool in **NEMO CE** (Django). An API call is triggered to the **Lab Storage Daemon** (Flask) running on the remote storage VPS.
-2. **Mounting**: The Daemon creates user and group directories, applies POSIX ACLs, configures disk quotas, and bind-mounts them under the active session path.
-3. **SMB Access**: The user accesses their files in real-time through an SSH tunnel to the VPS Samba share at `\\127.0.0.1\labsessions`.
-4. **Tool Check-out**: When usage ends, the daemon verifies there are no open files, safely unmounts the session, and clears the directories.
+1. **Tool Check-in**: A user checks into a tool in **NEMO CE** (Django). An API call is triggered to the **Daemon Listener** (Flask) running on the remote storage VPS.
+2. **IPC Forwarding**: The Listener validates the request and forwards it to the root-level **Daemon Controller** via a secure Unix socket.
+3. **Mounting**: The Controller creates user and group directories, applies POSIX ACLs, configures disk quotas, and bind-mounts them under the active session path.
+4. **SMB Access**: The user accesses their files in real-time through an SSH tunnel to the VPS Samba share at `\\127.0.0.1\labsessions`.
+5. **Tool Check-out**: When usage ends, the daemon verifies there are no open files, safely unmounts the session, and clears the directories.
 
 ---
 
 ## System Architecture
 The system consists of two primary applications:
-* **NEMO CE Client Plugin**: Runs inside Django; detects user log-ins/log-outs and tool check-ins to make signed HMAC-SHA256 API requests to the VPS.
-* **Lab Data Mount Daemon**: Runs on the VPS; interfaces directly with the Linux operating system to manage file systems, quotas, ACLs, and mounts.
+* **NEMO CE Client Plugin**: Runs inside Django; detects user log-ins/log-outs and tool check-ins to make secure API requests to the VPS.
+* **Split Lab Data Mount Daemon**:
+  * **Daemon Listener (Unprivileged):** Web-facing Flask server running as `www-data`. It terminates mTLS certificate validation, validates payloads, and forwards requests to the Controller.
+  * **Daemon Controller (Privileged):** Root worker listening *only* on a local Unix socket. It executes low-level system mounts, quotas, and permissions.
 
 ![System Architecture](arch.png)
 
@@ -54,13 +57,15 @@ The system consists of two primary applications:
 
 ## Network Topology
 ```
-+------------------------------------+          HTTPS / HMAC          +------------------------------------+
++------------------------------------+          HTTPS (mTLS)          +------------------------------------+
 |            Local Host              |------------------------------->|             Remote VPS             |
-|   - Django Web App (WSL)           |                                |   - Flask Storage Daemon (5000)    |
-|   - Windows Explorer (Samba Client)|<------------------------------ |   - Samba Share (smbd: 445)        |
-+------------------------------------+  SMB over SSH Tunnel (445:445) +------------------------------------+
+|   - Django Web App (WSL)           |                                |   - Daemon Listener (Flask: 5000)  |
+|   - Windows Explorer (Samba Client)|<------------------------------ |   - Unix Socket (AF_UNIX)          |
++------------------------------------+  SMB over SSH Tunnel (445:445) |   - Daemon Controller (root)       |
+                                                                      |   - Samba Share (smbd: 445)        |
+                                                                      +------------------------------------+
 ```
-* **Control Channel**: Flask Daemon listens on Port `5000` (secured by HMAC-SHA256 signature verification).
+* **Control Channel**: Nginx listens on Port `5000` (secured by mTLS verification), proxies requests to the `daemon_listener` Flask app (running locally on port 8080), which writes commands to the local Unix socket (`/var/run/lab-daemon/lab-daemon.sock`).
 * **Data Channel**: Samba server listens on Port `445` on the VPS. An SSH tunnel forwards local Windows Port `445` to the VPS Port `445` to enable secure Samba access over public networks.
 
 ---
@@ -162,28 +167,50 @@ idle_timeout_minutes: 60
 
 ---
 
-## Systemd Unit File
-To run the daemon as a background service on the VPS, install the following configuration to `/etc/systemd/system/lab-daemon.service`:
+## Systemd Unit Files
+To run the split daemon system securely as background services on the VPS, install the following configurations:
+
+### 1. Privileged Controller (`/etc/systemd/system/lab-daemon-controller.service`):
 ```ini
 [Unit]
-Description=Lab Data Mount Daemon
+Description=Lab Data Mount Daemon Controller (Privileged Worker)
 After=network.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/root/nemoce-daemon
-ExecStart=/root/nemoce-daemon/venv/bin/python -u daemon.py
+ExecStart=/root/nemoce-daemon/venv/bin/python -u daemon_controller.py
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 ```
-To view the live logs from the service, run:
-```bash
-journalctl -u lab-daemon -f
+
+### 2. Unprivileged Listener (`/etc/systemd/system/lab-daemon-listener.service`):
+```ini
+[Unit]
+Description=Lab Data Mount Daemon Listener (Unprivileged Flask Gateway)
+After=network.target lab-daemon-controller.service
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/root/nemoce-daemon
+ExecStart=/root/nemoce-daemon/venv/bin/python -u daemon_listener.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
 ```
 
+Enable and start both services:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable lab-daemon-controller --now
+sudo systemctl enable lab-daemon-listener --now
+```
 
 ---
 
@@ -193,13 +220,18 @@ NemoProject/
 ├── README.md               # Project-wide documentation
 ├── lab-daemon/             # Remote VPS Storage Daemon (This Repository)
 │   ├── arch.png            # Architecture Diagram (Embedded)
-│   ├── daemon.py           # Core API & routes
+│   ├── daemon_listener.py  # Unprivileged Flask API Gateway
+│   ├── daemon_controller.py# Privileged Unix Socket Command Worker
 │   ├── acl_manager.py      # ACL permissions wrapper
 │   ├── quota_manager.py    # Quota wrapper
 │   ├── session_state.py    # Session storage database
 │   ├── idle_monitor.py     # Idle tracking thread
 │   ├── config.yaml         # Configuration file
-│   └── requirements.txt    # Daemon dependencies
+│   ├── requirements.txt    # Daemon dependencies
+│   └── modules/
+│       ├── socket_comm.py  # Unix socket framing helper
+│       ├── nemo_sync.py    # NEMO sync loop
+│       └── ...
 └── nemo-ce/                # Local Django Application
     ├── manage.py
     └── NEMO/

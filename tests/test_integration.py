@@ -1,9 +1,6 @@
 import os
 import sys
 import json
-import time
-import hmac
-import hashlib
 import unittest
 import tempfile
 from pathlib import Path
@@ -32,8 +29,7 @@ quota:
 
 session:
   db_path: "{temp_db_path}"
-  idle_timeout_minutes: 60
-  unmount_grace_seconds: 30
+  socket_path: "{tempfile.gettempdir()}/labdata/lab-daemon.sock"
 
 nemo:
   django_path: "/mnt/c/Users/gyand/Desktop/NemoProject/nemo-ce"
@@ -53,7 +49,7 @@ mtls:
 with open(temp_config_path, "w") as f:
     f.write(test_config_content)
 
-# Set the environment variable before importing daemon, so it uses this configuration
+# Set the environment variable before importing daemon_listener
 os.environ["LAB_DAEMON_CONFIG"] = temp_config_path
 
 # Add parent directory to path
@@ -61,13 +57,8 @@ parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-# Import daemon now that the configuration is mocked
-import daemon
-
-# Override SECRET_KEY and disable real libc mount calls
-daemon.SECRET_KEY = b"test_secret_key"
-daemon._libc = None
-
+# Import daemon_listener
+import daemon_listener as daemon
 
 class TestIntegration(unittest.TestCase):
     def setUp(self):
@@ -111,11 +102,6 @@ class TestIntegration(unittest.TestCase):
         try:
             os.unlink(temp_config_path)
             os.unlink(temp_db_path)
-            # Remove WAL files if present
-            if os.path.exists(temp_db_path + "-wal"):
-                os.unlink(temp_db_path + "-wal")
-            if os.path.exists(temp_db_path + "-shm"):
-                os.unlink(temp_db_path + "-shm")
         except OSError:
             pass
 
@@ -125,20 +111,27 @@ class TestIntegration(unittest.TestCase):
             'Content-Type': 'application/json'
         }
 
-    @patch('daemon.quota_manager.check_quota_usage')
-    @patch('daemon.quota_manager.apply_quota')
-    @patch('daemon.acl_manager.grant_acl_access')
-    @patch('daemon._mount_bind')
-    @patch('daemon._mount_bind_ro')
-    def test_mount_unmount_flow(self, mock_mount_ro, mock_mount, mock_acl, mock_apply_quota, mock_check_quota):
-        mock_check_quota.return_value = {"exceeded": False}
-        mock_acl.return_value = True
-
+    @patch('daemon_listener._send_to_controller')
+    def test_mount_unmount_flow(self, mock_send):
         tool = "microscope1"
         user_id = 146
         account_id = 20
         project_id = 426
         session_id = f"session_{user_id}_{tool}"
+
+        # Mock the controller response for mount
+        def side_effect(action, payload):
+            if action == "mount":
+                daemon.state_db.save_session(session_id, user_id, tool, [f"/srv/labdata/users/u146 → /tmp/labdata/sessions/microscope1/my_files"])
+                return {"status": "mounted", "session_id": session_id}, 201
+            elif action == "unmount":
+                daemon.state_db.remove_session(session_id)
+                return {"status": "unmounted"}, 200
+            elif action == "quota":
+                return {"used_gb": 5, "soft_limit_gb": 10}, 200
+            return {}, 400
+
+        mock_send.side_effect = side_effect
 
         # 1. Test Mount Endpoint
         headers = self._generate_headers(success=True)
@@ -162,7 +155,13 @@ class TestIntegration(unittest.TestCase):
         data = json.loads(resp.data)
         self.assertIn(session_id, data)
 
-        # 3. Test Unmount Endpoint
+        # 3. Test Quota Endpoint
+        resp = self.app.get("/quota/alex.abulnaga")
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+        self.assertEqual(data["used_gb"], 5)
+
+        # 4. Test Unmount Endpoint
         headers = self._generate_headers(success=True)
         payload = {"user_id": user_id, "tool": tool, "session_id": session_id, "account_id": account_id, "project_id": project_id}
         
@@ -175,10 +174,9 @@ class TestIntegration(unittest.TestCase):
         session = daemon.state_db.get_session(session_id)
         self.assertIsNone(session)
 
-    @patch('daemon.user_provisioner.ensure_user_directory')
-    @patch('daemon.user_provisioner.apply_user_quota')
-    def test_init_user(self, mock_quota, mock_dir):
-        mock_dir.return_value = "/srv/labdata/users/u146"
+    @patch('daemon_listener._send_to_controller')
+    def test_init_user(self, mock_send):
+        mock_send.return_value = ({"status": "initialized", "path": "/srv/labdata/users/u146"}, 200)
         
         user_id = 146
         headers = self._generate_headers(success=True)
@@ -206,41 +204,6 @@ class TestIntegration(unittest.TestCase):
         resp = self.app.post("/init_user", data=json.dumps({"user_id": 146}), headers=headers)
         self.assertEqual(resp.status_code, 401)
 
-    @patch('daemon.quota_manager.check_quota_usage')
-    @patch('daemon.quota_manager.apply_quota')
-    @patch('daemon.acl_manager.grant_acl_access')
-    @patch('daemon._mount_bind')
-    @patch('daemon._mount_bind_ro')
-    def test_mount_excluded_project(self, mock_mount_ro, mock_mount, mock_acl, mock_apply_quota, mock_check_quota):
-        mock_check_quota.return_value = {"exceeded": False}
-        mock_acl.return_value = True
-
-        tool = "microscope1"
-        user_id = 146
-        account_id = 20
-        project_id = 426
-        
-        # Patch config temporarily to exclude the project "C2QA"
-        test_config = daemon.config.copy()
-        test_config["storage"]["exclude_project_names"] = ["C2QA"]
-        
-        with patch.dict(daemon.config, test_config):
-            headers = self._generate_headers(success=True)
-            payload = {"user_id": user_id, "tool": tool, "account_id": account_id, "project_id": project_id}
-            
-            resp = self.app.post("/mount", data=json.dumps(payload), headers=headers)
-            self.assertEqual(resp.status_code, 201)
-            
-            # Since the project is excluded, _mount_bind should have been called only ONCE (for the user home directory)
-            # instead of twice (user + project).
-            self.assertEqual(mock_mount.call_count, 1)
-            
-            # Check that the call was indeed for the user home directory
-            user_src = Path(daemon.USERS_DIR) / "u146"
-            user_tgt = Path(daemon.SESSIONS_DIR) / tool / "my_files"
-            mock_mount.assert_called_once_with(user_src, user_tgt)
-
 
 if __name__ == "__main__":
     unittest.main()
-

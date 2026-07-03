@@ -184,7 +184,57 @@ sync:
 
 ---
 
-## ☁️ 6. Nextcloud & SAML SSO Configuration
+## ⚙️ 6. Systemd Service Configurations
+
+To run the split daemon system securely, configure two separate systemd services: one for the privileged controller (root) and one for the unprivileged listener (www-data).
+
+### A. Privileged Controller Service
+Create `/etc/systemd/system/lab-daemon-controller.service`:
+```ini
+[Unit]
+Description=Lab Data Mount Daemon Controller (Privileged Worker)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/nemoce-daemon
+ExecStart=/root/nemoce-daemon/venv/bin/python -u daemon_controller.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### B. Unprivileged Listener Service
+Create `/etc/systemd/system/lab-daemon-listener.service`:
+```ini
+[Unit]
+Description=Lab Data Mount Daemon Listener (Unprivileged Flask Gateway)
+After=network.target lab-daemon-controller.service
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/root/nemoce-daemon
+ExecStart=/root/nemoce-daemon/venv/bin/python -u daemon_listener.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start both services:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable lab-daemon-controller --now
+sudo systemctl enable lab-daemon-listener --now
+```
+
+---
+
+## ☁️ 7. Nextcloud & SAML SSO Configuration
 
 To integrate Nextcloud with Princeton’s Web SSO (Shibboleth):
 
@@ -203,7 +253,7 @@ To integrate Nextcloud with Princeton’s Web SSO (Shibboleth):
 
 ---
 
-## 🛡️ 7. Nextcloud Upload Security & File Sanitization
+## 🛡️ 8. Nextcloud Upload Security & File Sanitization
 
 Since files uploaded via Nextcloud are accessed directly by Samba on Windows-based Tool PCs, enforcing strict security and sanitization at the upload gateway is critical.
 
@@ -249,7 +299,7 @@ Prevent researchers from uploading executable files (`.exe`, `.bat`, `.sh`) whic
 
 ---
 
-## 🖥️ 8. Samba Configuration (Tool PCs)
+## 🖥️ 9. Samba Configuration (Tool PCs)
 
 Edit `/etc/samba/smb.conf` to expose the active session mount folders to the air-gapped lab computers:
 
@@ -288,7 +338,7 @@ Each instrument computer connects to the file server using a unique local machin
 
 ---
 
-## 🛡️ 9. Permissions & Quota Administration
+## 🛡️ 10. Permissions & Quota Administration
 
 The daemon manages permissions dynamically at runtime:
 
@@ -308,4 +358,5 @@ The daemon manages permissions dynamically at runtime:
   # Allocates group limits to project folder group
   setquota -g proj_{project_id} 50G 60G 0 0 /srv/labdata
   ```
+
 
