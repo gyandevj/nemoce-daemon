@@ -58,13 +58,22 @@ sudo apt install -y redis-server php-redis
 ---
 
 
-## 💾 3. Storage Mount Configuration (6 TB SMB Share)
+## 💾 3. Storage Mount Configuration (6 TB NFS or SMB Share)
 
-The 6 TB primary storage directory resides on a separate server and is mounted as an SMB share.
+The 6 TB primary storage directory resides on a separate server and is mounted on the Storage VM.
 
 > [!IMPORTANT]
-> Because standard Linux quotas (`setquota`) do not function on mounted network SMB shares, you must coordinate with the storage provider to handle user/group size limits at the host level, or configure the daemon to compute folder usage dynamically via `du` scans.
+> Because standard Linux quotas (`setquota`) do not function on mounted network SMB or NFS shares, you must coordinate with the storage provider to handle user/group size limits at the host level, or configure the daemon to compute folder usage dynamically.
 
+### Option A: Mounting via NFS (Recommended)
+To prevent network drops or storage server downtime from locking up the Daemon Controller, you **must** mount the NFS share using the `soft`, `intr` (interruptible), and `timeo` (timeout) flags. This ensures system calls like `mount` fail with a timeout rather than hanging indefinitely in uninterruptible kernel sleep (D-state).
+
+Add the following to `/etc/fstab` on the server:
+```text
+storage_server:/export/labdata /srv/labdata nfs rsize=8192,wsize=8192,timeo=50,soft,intr,actimeo=0,acl 0 0
+```
+
+### Option B: Mounting via SMB/CIFS
 To support the daemon's permission updates, the SMB share must be mounted on the VM with **POSIX ACL support enabled**. 
 
 Add the following to `/etc/fstab` on the server:

@@ -95,6 +95,10 @@ def verify_client_auth() -> bool:
             log.warning(f"🔐 mTLS verification failed: X-Client-Verify is '{client_verify}'")
             return False
         return True
+    # If the header is missing, block the request if mTLS is enabled
+    if config.get("mtls", {}).get("enabled"):
+        log.warning("🔐 mTLS verification failed: X-Client-Verify header is missing")
+        return False
     return True
 
 def _validate_request():
@@ -123,9 +127,11 @@ def _validate_request():
     except Exception:
         return None, ({"error": "Invalid ID format — user_id, account_id, project_id must be integers"}, 400)
 
-    for name in (user_id_str, tool):
-        if "/" in name or "\\" in name or name in (".", ".."):
-            return None, ({"error": "Invalid characters in user_id or tool"}, 400)
+    import re
+    if not re.match(r"^[a-zA-Z0-9._-]+$", user_id_str):
+        return None, ({"error": "Invalid characters in 'user_id' — must contain only letters, numbers, dots, hyphens, or underscores"}, 400)
+    if not re.match(r"^[a-zA-Z0-9_-]+$", tool):
+        return None, ({"error": "Invalid characters in 'tool' — must contain only letters, numbers, hyphens, or underscores"}, 400)
 
     return {
         "user_id": user_id,

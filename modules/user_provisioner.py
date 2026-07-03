@@ -144,6 +144,9 @@ class UserProvisioner:
             # Grant NextCloud daemon (www-data) access to read/write this user folder via ACLs
             subprocess.run(["setfacl", "-m", "u:www-data:rwx", str(user_dir)], capture_output=True)
             subprocess.run(["setfacl", "-d", "-m", "u:www-data:rwx", str(user_dir)], capture_output=True)
+            # Ensure any files/folders created by Nextcloud give the user full access
+            subprocess.run(["setfacl", "-m", f"u:{linux_user}:rwx", str(user_dir)], capture_output=True)
+            subprocess.run(["setfacl", "-d", "-m", f"u:{linux_user}:rwx", str(user_dir)], capture_output=True)
         except Exception as e:
             logger.debug(f"Failed to set directory permissions/chown on '{user_dir}': {e}")
             
