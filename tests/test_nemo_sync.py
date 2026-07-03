@@ -72,5 +72,52 @@ class TestNemoSync(unittest.TestCase):
         self.mock_provisioner.ensure_project_directory.assert_called_with(20, 426)
         self.mock_provisioner.sync_user_groups.assert_called_with(146, [426])
 
+    def test_excluded_projects(self):
+        # Configure mocks to include an excluded project ("Buddy") under excluded account ("Administration")
+        self.mock_api.get_accounts.return_value = [
+            {"id": 20, "name": "Nathalie de Leon", "active": True},
+            {"id": 30, "name": "Administration", "active": True}
+        ]
+        self.mock_api.get_projects.return_value = [
+            {"id": 426, "account": 20, "name": "C2QA-De Leon", "active": True},
+            {"id": 500, "account": 30, "name": "Buddy", "active": True}
+        ]
+        self.mock_api.get_users.return_value = [
+            {"id": 146, "username": "alex.abulnaga", "first_name": "Alex", "last_name": "Abulnaga", "is_active": True, "projects": [426, 500]}
+        ]
+
+        # Reset mock call counts
+        self.mock_provisioner.reset_mock()
+
+        # Initialize sync with exclusions
+        sync_with_excludes = NemoSync(
+            api_client=self.mock_api,
+            db=self.db,
+            user_provisioner=self.mock_provisioner,
+            on_deactivation="lock_account",
+            dry_run=False,
+            exclude_project_names=["Buddy"],
+            exclude_account_names=["Administration"]
+        )
+
+        sync_with_excludes.run_once()
+
+        # Check DB project upserts happened (we want projects in SQLite for state tracking)
+        self.assertIsNotNone(self.db.get_project_by_id(426))
+        self.assertIsNotNone(self.db.get_project_by_id(500))
+
+        # Check that directory was provisioned for standard project
+        self.mock_provisioner.ensure_project_directory.assert_any_call(20, 426)
+        
+        # Check that directory was NOT provisioned for the excluded project/account
+        # We assert that ensure_project_directory was never called with (30, 500)
+        for call_args in self.mock_provisioner.ensure_project_directory.call_args_list:
+            self.assertNotEqual(call_args[0], (30, 500))
+
+        # Verify that only project 426 (not 500) was synced to the Linux groups
+        self.mock_provisioner.sync_user_groups.assert_called_with(146, [426])
+
+
 if __name__ == "__main__":
     unittest.main()
+

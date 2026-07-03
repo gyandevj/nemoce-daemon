@@ -12,15 +12,54 @@ class NemoSync:
     Periodically syncs NEMO accounts, projects, users, and memberships
     with local system directories, users, groups, quotas, and DB state.
     """
-    def __init__(self, api_client: NemoAPIClient, db: StateDB, user_provisioner: UserProvisioner, on_deactivation: str = "lock_account", poll_interval: int = 3600, dry_run: bool = False):
+    def __init__(self, api_client: NemoAPIClient, db: StateDB, user_provisioner: UserProvisioner,
+                 on_deactivation: str = "lock_account", poll_interval: int = 3600, dry_run: bool = False,
+                 exclude_project_ids=None, exclude_account_ids=None,
+                 exclude_project_names=None, exclude_account_names=None):
         self.api_client = api_client
         self.db = db
         self.user_provisioner = user_provisioner
         self.on_deactivation = on_deactivation
         self.poll_interval = poll_interval
         self.dry_run = dry_run
+        
+        self.exclude_project_ids = exclude_project_ids or []
+        self.exclude_account_ids = exclude_account_ids or []
+        self.exclude_project_names = exclude_project_names or []
+        self.exclude_account_names = exclude_account_names or []
+        
         self._running = False
         self._thread = None
+
+    def _is_project_excluded(self, proj_id, proj_name, account_id) -> bool:
+        # Check project ID
+        if proj_id in self.exclude_project_ids:
+            return True
+        # Check project name (case-insensitive)
+        p_names = [n.lower() for n in self.exclude_project_names]
+        if proj_name and proj_name.lower() in p_names:
+            return True
+        # Check account ID
+        if account_id in self.exclude_account_ids:
+            return True
+        # Check account name (case-insensitive)
+        if account_id:
+            acc_info = self.db.get_account_by_id(account_id)
+            if acc_info:
+                a_names = [n.lower() for n in self.exclude_account_names]
+                if acc_info["name"] and acc_info["name"].lower() in a_names:
+                    return True
+        return False
+
+    def _is_project_id_excluded(self, proj_id) -> bool:
+        proj_info = self.db.get_project_by_id(proj_id)
+        if not proj_info:
+            return proj_id in self.exclude_project_ids
+        
+        proj_name = proj_info.get("name")
+        account_id = proj_info.get("account_id")
+        return self._is_project_excluded(proj_id, proj_name, account_id)
+
 
     def run_once(self):
         """
@@ -76,6 +115,12 @@ class NemoSync:
             if not self.dry_run:
                 # Store in DB
                 self.db.upsert_project(proj_id, account_id, name, linux_group, path, active)
+                
+                # Skip provisioning if the project or its account is excluded
+                if self._is_project_excluded(proj_id, name, account_id):
+                    logger.info(f"Skipping Linux group and directory provisioning for excluded project: '{name}' (ID: {proj_id})")
+                    continue
+                
                 # Provision Linux group and project directory
                 self.user_provisioner.provision_group(proj_id)
                 if account_id:
@@ -121,6 +166,9 @@ class NemoSync:
             else:
                 new_projects = set(user.get("projects", []))
                 
+            # Filter out any projects that are excluded from group storage
+            new_projects = {pid for pid in new_projects if not self._is_project_id_excluded(pid)}
+            
             old_projects = self.db.get_user_projects(user_id)
             
             # Find differences
@@ -137,6 +185,7 @@ class NemoSync:
                 
                 # Sync memberships to Linux user groups
                 self.user_provisioner.sync_user_groups(user_id, list(new_projects))
+
 
     # --- Background Loop Control ---
 

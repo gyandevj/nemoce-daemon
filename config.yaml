@@ -10,6 +10,14 @@ storage:
   # This choice is locked at initial deployment.
   group_folder_type: "hierarchical"
 
+  # Exclusions: Skip creating group folders and Linux groups for certain NEMO accounts/projects
+  # (e.g. system projects or policy accounts like "Administration" or "Buddy" that do not need storage).
+  exclude_project_ids: []
+  exclude_account_ids: []
+  exclude_project_names: ["Buddy"]
+  exclude_account_names: ["Administration"]
+
+
 mtls:
   enabled: true
   ca_cert: "certs/ca.crt"

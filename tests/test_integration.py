@@ -206,6 +206,41 @@ class TestIntegration(unittest.TestCase):
         resp = self.app.post("/init_user", data=json.dumps({"user_id": 146}), headers=headers)
         self.assertEqual(resp.status_code, 401)
 
+    @patch('daemon.quota_manager.check_quota_usage')
+    @patch('daemon.quota_manager.apply_quota')
+    @patch('daemon.acl_manager.grant_acl_access')
+    @patch('daemon._mount_bind')
+    @patch('daemon._mount_bind_ro')
+    def test_mount_excluded_project(self, mock_mount_ro, mock_mount, mock_acl, mock_apply_quota, mock_check_quota):
+        mock_check_quota.return_value = {"exceeded": False}
+        mock_acl.return_value = True
+
+        tool = "microscope1"
+        user_id = 146
+        account_id = 20
+        project_id = 426
+        
+        # Patch config temporarily to exclude the project "C2QA"
+        test_config = daemon.config.copy()
+        test_config["storage"]["exclude_project_names"] = ["C2QA"]
+        
+        with patch.dict(daemon.config, test_config):
+            headers = self._generate_headers(success=True)
+            payload = {"user_id": user_id, "tool": tool, "account_id": account_id, "project_id": project_id}
+            
+            resp = self.app.post("/mount", data=json.dumps(payload), headers=headers)
+            self.assertEqual(resp.status_code, 201)
+            
+            # Since the project is excluded, _mount_bind should have been called only ONCE (for the user home directory)
+            # instead of twice (user + project).
+            self.assertEqual(mock_mount.call_count, 1)
+            
+            # Check that the call was indeed for the user home directory
+            user_src = Path(daemon.USERS_DIR) / "u146"
+            user_tgt = Path(daemon.SESSIONS_DIR) / tool / "my_files"
+            mock_mount.assert_called_once_with(user_src, user_tgt)
+
 
 if __name__ == "__main__":
     unittest.main()
+

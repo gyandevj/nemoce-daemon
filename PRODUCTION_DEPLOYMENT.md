@@ -159,6 +159,13 @@ storage:
   # in my_groups. "account" exposes a flat list of accounts/PI folders.
   group_folder_type: "project" 
 
+  # Account & Project exclusions (skip creating group storage / Linux groups)
+  exclude_project_ids: []
+  exclude_account_ids: []
+  exclude_project_names: ["Buddy"]
+  exclude_account_names: ["Administration"]
+
+
 mtls:
   enabled: true
   ca_cert: "/etc/ssl/certs/lab-daemon-ca.crt"

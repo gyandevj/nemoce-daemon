@@ -93,7 +93,11 @@ DEFAULT_CONFIG = {
         "groups_path": "/srv/labdata/groups",
         "sessions_path": "/tmp/labdata/sessions",
         "public_path": "/srv/labdata/public",
-        "group_folder_type": "project"  # project | account | hierarchical
+        "group_folder_type": "project",  # project | account | hierarchical
+        "exclude_project_ids": [],
+        "exclude_account_ids": [],
+        "exclude_project_names": [],
+        "exclude_account_names": []
     },
     "quota": {
         "default_soft": 10,  # GB
@@ -177,7 +181,11 @@ nemo_sync = NemoSync(
     user_provisioner=user_provisioner,
     on_deactivation=config["sync"]["on_deactivation"],
     poll_interval=config["nemo"]["poll_interval_seconds"],
-    dry_run=config["sync"]["dry_run"]
+    dry_run=config["sync"]["dry_run"],
+    exclude_project_ids=config["storage"].get("exclude_project_ids", []),
+    exclude_account_ids=config["storage"].get("exclude_account_ids", []),
+    exclude_project_names=config["storage"].get("exclude_project_names", []),
+    exclude_account_names=config["storage"].get("exclude_account_names", [])
 )
 
 # ---------------------------------------------------------------------------
@@ -381,8 +389,28 @@ def _safe_name(name: str) -> str:
     return name if name else "unnamed_folder"
 
 
+def is_project_excluded(proj_id: int, proj_name: str, account_id: int, account_name: str) -> bool:
+    """
+    Check if a project or account is in the exclusions lists from config.
+    """
+    if proj_id in config["storage"].get("exclude_project_ids", []):
+        return True
+    if account_id in config["storage"].get("exclude_account_ids", []):
+        return True
+    
+    p_names = [n.lower() for n in config["storage"].get("exclude_project_names", [])]
+    if proj_name and proj_name.lower() in p_names:
+        return True
+        
+    a_names = [n.lower() for n in config["storage"].get("exclude_account_names", [])]
+    if account_name and account_name.lower() in a_names:
+        return True
+        
+    return False
+
 
 def verify_client_auth() -> bool:
+
     """
     Verify Mutual TLS (mTLS) client certificate verification.
     If behind a reverse proxy (like Nginx), we check the proxy header 'X-Client-Verify'.
@@ -517,8 +545,12 @@ def mount_endpoint():
         log.warning(f"❌ Mount rejected: Project '{project_info['name']}' is deactivated.")
         return jsonify({"error": "Project is deactivated"}), 403
 
-    account_folder = _safe_name(account_info["name"]) if account_info else f"account_{account_id}"
-    project_folder = _safe_name(project_info["name"]) if project_info else f"project_{project_id}"
+    account_name = account_info["name"] if account_info else ""
+    project_name = project_info["name"] if project_info else ""
+    account_folder = _safe_name(account_name) if account_name else f"account_{account_id}"
+    project_folder = _safe_name(project_name) if project_name else f"project_{project_id}"
+    
+    project_excluded = is_project_excluded(project_id, project_name, account_id, account_name)
 
     # -----------------------------------------------------------------------
     # Target paths (ephemeral session view under /tmp/labdata/sessions)
@@ -538,17 +570,20 @@ def mount_endpoint():
         target_project = SESSIONS_DIR / tool / "my_groups" / account_folder / project_folder
         log.info(f"Session folders: my_groups/{account_folder}/{project_folder} (type: hierarchical)")
 
-    # Ensure source project directory exists (in case sync hasn't run yet)
+    # Ensure source directories exist (in case sync hasn't run yet)
     try:
         source_user.mkdir(parents=True, exist_ok=True)
-        source_project.mkdir(parents=True, exist_ok=True)
         target_user.mkdir(parents=True, exist_ok=True)
-        target_project.parent.mkdir(parents=True, exist_ok=True)
-        target_project.mkdir(parents=True, exist_ok=True)
         target_public.mkdir(parents=True, exist_ok=True)
+        
+        if not project_excluded:
+            source_project.mkdir(parents=True, exist_ok=True)
+            target_project.parent.mkdir(parents=True, exist_ok=True)
+            target_project.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         log.error(f"Failed to create mount directories: {exc}")
         return jsonify({"error": str(exc)}), 500
+
 
     # -----------------------------------------------------------------------
     # Provision the tool machine account and grant POSIX ACLs
@@ -557,11 +592,14 @@ def mount_endpoint():
 
     # User private directory
     acl_manager.grant_acl_access(tool_machine, str(source_user), "rwx")
-    # Traverse access on the specific account dir only
-    acc_dir = GROUPS_DIR / f"account_{account_id}"
-    acl_manager.grant_acl_access(tool_machine, str(acc_dir), "x")
-    # Full read/write on the specific project dir
-    acl_manager.grant_acl_access(tool_machine, str(source_project), "rwx")
+    
+    if not project_excluded:
+        # Traverse access on the specific account dir only
+        acc_dir = GROUPS_DIR / f"account_{account_id}"
+        acl_manager.grant_acl_access(tool_machine, str(acc_dir), "x")
+        # Full read/write on the specific project dir
+        acl_manager.grant_acl_access(tool_machine, str(source_project), "rwx")
+        
     # Public directory (read-only)
     if PUBLIC_DIR.exists() and PUBLIC_DIR.is_dir():
         acl_manager.grant_acl_access(tool_machine, str(PUBLIC_DIR), "rx")
@@ -587,17 +625,21 @@ def mount_endpoint():
     # B. Specific project directory -> my_groups/account_{id}/project_{id}/
     #    Only the checked-in project is exposed — not the entire groups tree.
     # -----------------------------------------------------------------------
-    project_already_mounted = _is_mountpoint(target_project)
-    if project_already_mounted:
-        log.info(f"✅ Project {project_id} already mounted on {tool}")
+    if not project_excluded:
+        project_already_mounted = _is_mountpoint(target_project)
+        if project_already_mounted:
+            log.info(f"✅ Project {project_id} already mounted on {tool}")
+        else:
+            try:
+                _mount_bind(source_project, target_project)
+                log.info(f"✅ MOUNT SUCCESS (project): {source_project} → {target_project}")
+            except OSError as exc:
+                log.error(f"❌ MOUNT FAILED for project {project_id} on {tool}: {exc}")
+                # Non-fatal — continue to mount public
+        mount_points.append(f"{source_project} → {target_project}")
     else:
-        try:
-            _mount_bind(source_project, target_project)
-            log.info(f"✅ MOUNT SUCCESS (project): {source_project} → {target_project}")
-        except OSError as exc:
-            log.error(f"❌ MOUNT FAILED for project {project_id} on {tool}: {exc}")
-            # Non-fatal — continue to mount public
-    mount_points.append(f"{source_project} → {target_project}")
+        log.info(f"ℹ️ Skipping mount of project {project_id} because it or its account is excluded from group storage.")
+
 
     # -----------------------------------------------------------------------
     # C. Public directory -> public/ (read-only)
