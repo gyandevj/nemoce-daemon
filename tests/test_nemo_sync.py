@@ -117,6 +117,39 @@ class TestNemoSync(unittest.TestCase):
         # Verify that only project 426 (not 500) was synced to the Linux groups
         self.mock_provisioner.sync_user_groups.assert_called_with(146, [426])
 
+    def test_my_groups_symlinks(self):
+        import tempfile
+        import os
+        from pathlib import Path
+        
+        with tempfile.TemporaryDirectory() as temp_users_dir:
+            self.mock_provisioner.users_path = temp_users_dir
+            
+            user_dir = Path(temp_users_dir) / "u146"
+            user_dir.mkdir()
+            
+            self.db.upsert_account(20, "Nathalie de Leon", True)
+            self.db.upsert_project(
+                proj_id=426,
+                account_id=20,
+                name="C2QA-De Leon",
+                linux_group="proj_426",
+                path="/srv/labdata/groups/account_20/project_426",
+                active=True
+            )
+            
+            self.sync._sync_user_my_groups_symlinks(146, [426])
+            
+            my_groups_dir = user_dir / "my_groups"
+            self.assertTrue(my_groups_dir.exists())
+            
+            symlink_path = my_groups_dir / "C2QA-De Leon"
+            self.assertTrue(symlink_path.is_symlink())
+            self.assertEqual(os.readlink(str(symlink_path)), "/srv/labdata/groups/account_20/project_426")
+            
+            self.sync._sync_user_my_groups_symlinks(146, [])
+            self.assertFalse(symlink_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

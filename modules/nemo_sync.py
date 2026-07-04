@@ -185,6 +185,76 @@ class NemoSync:
                 
                 # Sync memberships to Linux user groups
                 self.user_provisioner.sync_user_groups(user_id, list(new_projects))
+                
+                # Sync memberships to permanent Nextcloud group symlinks
+                self._sync_user_my_groups_symlinks(user_id, list(new_projects))
+
+    def _sync_user_my_groups_symlinks(self, user_id, project_ids):
+        import os
+        import re
+        import subprocess
+        from pathlib import Path
+        
+        def _safe_name(name: str) -> str:
+            if not name:
+                return name
+            name = re.sub(r'[/\\:\*\?"<>\|]', '_', name)
+            name = re.sub(r' +', ' ', name).strip()
+            name = name.rstrip('.')
+            reserved_patterns = re.compile(r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$', re.IGNORECASE)
+            if reserved_patterns.match(name):
+                name = f"_{name}"
+            return name if name else "unnamed_folder"
+
+        user_dir = Path(self.user_provisioner.users_path) / f"u{user_id}"
+        if not user_dir.exists() or not user_dir.is_dir():
+            return
+
+        my_groups_dir = user_dir / "my_groups"
+        try:
+            my_groups_dir.mkdir(exist_ok=True)
+            subprocess.run(["chown", "-R", f"u{user_id}:nogroup", str(my_groups_dir)], capture_output=True)
+            subprocess.run(["chmod", "770", str(my_groups_dir)], capture_output=True)
+        except Exception:
+            pass
+
+        expected_links = {}
+        for pid in project_ids:
+            proj_info = self.db.get_project_by_id(pid)
+            if proj_info:
+                safe_name = _safe_name(proj_info["name"])
+                expected_links[safe_name] = proj_info["path"]
+
+        try:
+            for item in my_groups_dir.iterdir():
+                if item.is_symlink():
+                    link_name = item.name
+                    if link_name not in expected_links:
+                        logger.info(f"Removing stale group symlink: {item}")
+                        item.unlink()
+                    else:
+                        try:
+                            target = os.readlink(str(item))
+                            if target != expected_links[link_name]:
+                                logger.info(f"Recreating incorrect group symlink: {item} -> {expected_links[link_name]}")
+                                item.unlink()
+                        except Exception:
+                            item.unlink()
+        except Exception as e:
+            logger.error(f"Error cleaning up stale symlinks in {my_groups_dir}: {e}")
+
+        for link_name, target_path in expected_links.items():
+            link_path = my_groups_dir / link_name
+            if not link_path.exists() and not link_path.is_symlink():
+                try:
+                    logger.info(f"Creating group symlink: {link_path} -> {target_path}")
+                    os.symlink(target_path, str(link_path))
+                    try:
+                        subprocess.run(["chown", "-h", f"u{user_id}:nogroup", str(link_path)], capture_output=True)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.warning(f"Failed to create group symlink {link_path}: {e}")
 
 
     # --- Background Loop Control ---

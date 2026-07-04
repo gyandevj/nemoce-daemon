@@ -257,7 +257,7 @@ To integrate Nextcloud with Princeton’s Web SSO (Shibboleth):
 3. **Mount Storage via External Storage App:**
    Enable the `External Storage Support` app in Nextcloud. Configure it to map local filesystem paths to Nextcloud directories:
    * **`myFiles`:** Map Local path `/srv/labdata/users/$user` (Nextcloud dynamically interpolates `$user` to match the logged-in SAML username).
-   * **`myGroups`:** Map Local path `/srv/labdata/groups/`. Because Nextcloud runs as the `www-data` system account, it will automatically respect OS-level POSIX ACLs, only showing users the specific folders they are authorized to open.
+   * **`myGroups`:** Map Local path `/srv/labdata/users/$user/my_groups/` (This points to the user's permanent groups folder populated dynamically with symbolic links by the `NemoSync` background cron, ensuring complete privacy isolation).
    * **`public`:** Map Local path `/srv/labdata/public` (read-only for normal users, read-write for manager/staff).
 
 ---
@@ -310,7 +310,7 @@ Prevent researchers from uploading executable files (`.exe`, `.bat`, `.sh`) whic
 
 ## 🖥️ 9. Samba Configuration (Tool PCs)
 
-Edit `/etc/samba/smb.conf` to expose the active session mount folders to the air-gapped lab computers:
+To prevent air-gapped instrument computers from browsing or modifying other active instrument sessions, do **not** expose a single shared root directory. Instead, define **isolated, tool-specific shares** in `/etc/samba/smb.conf`:
 
 ```ini
 [global]
@@ -321,29 +321,47 @@ Edit `/etc/samba/smb.conf` to expose the active session mount folders to the air
     log file = /var/log/samba/log.%m
     max log size = 1000
 
-[labsessions]
-    comment = Active Instrument Lab Sessions
-    path = /tmp/labdata/sessions
+# Scoped Microscope 1 share
+[microscope1]
+    comment = Microscope 1 Active Session
+    path = /tmp/labdata/sessions/microscope1
     browseable = yes
     read only = no
     guest ok = no
+    valid users = microscope1_machine
     create mask = 0770
     directory mask = 0770
-    # Operations execute as root to resolve mounts, but SMB verifies credentials first
+    force user = root
+
+# Scoped Microscope 2 share
+[microscope2]
+    comment = Microscope 2 Active Session
+    path = /tmp/labdata/sessions/microscope2
+    browseable = yes
+    read only = no
+    guest ok = no
+    valid users = microscope2_machine
+    create mask = 0770
+    directory mask = 0770
     force user = root
 ```
 
-### Adding a new Tool PC Account
-Each instrument computer connects to the file server using a unique local machine account:
-1. Create the system account:
+### Adding new Tool PC Accounts
+Each instrument computer connects to its respective scoped Samba share using a unique machine account:
+
+1. Create the system accounts:
    ```bash
    sudo useradd -M -g nogroup -s /usr/sbin/nologin -c "NEMO Machine Microscope1" microscope1_machine
+   sudo useradd -M -g nogroup -s /usr/sbin/nologin -c "NEMO Machine Microscope2" microscope2_machine
    ```
-2. Add the user to the Samba password registry:
+2. Add the users to the Samba password registry:
    ```bash
    sudo smbpasswd -a microscope1_machine
+   sudo smbpasswd -a microscope2_machine
    ```
-3. Map the path `\\<fileserver_ip>\labsessions\microscope1` permanently on the microscope computer using the `microscope1_machine` credentials.
+3. Map the isolated paths on each instrument PC using the respective machine credentials:
+   * **Microscope 1 PC mounts:** `\\<fileserver_ip>\microscope1`
+   * **Microscope 2 PC mounts:** `\\<fileserver_ip>\microscope2`
 
 ---
 
