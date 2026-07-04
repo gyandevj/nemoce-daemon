@@ -386,4 +386,14 @@ The daemon manages permissions dynamically at runtime:
   setquota -g proj_{project_id} 50G 60G 0 0 /srv/labdata
   ```
 
+* **SQLite Database Directory Permissions:**
+  Because the unprivileged Flask Gateway (`lab-daemon-listener` running as `www-data`) queries active session state, it requires write permission to the SQLite directory `/var/lib/lab-daemon` to initialize journal logs (`WAL` mode):
+  ```bash
+  # Grant www-data group write permission to the database directory and files
+  sudo chown -R root:www-data /var/lib/lab-daemon
+  sudo chmod 770 /var/lib/lab-daemon
+  sudo find /var/lib/lab-daemon -type f -exec chmod 660 {} +
+  ```
+
+
 
