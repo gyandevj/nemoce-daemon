@@ -51,7 +51,7 @@ The system consists of two primary applications:
   * **Daemon Listener (Unprivileged):** Web-facing Flask server running as `www-data`. It terminates mTLS certificate validation, validates payloads, and forwards requests to the Controller.
   * **Daemon Controller (Privileged):** Root worker listening *only* on a local Unix socket. It executes low-level system mounts, quotas, and permissions.
 
-![System Architecture](arch.png)
+![System Architecture](LabDaemonSplitFileServer/SplitServerDiagramA.png)
 
 ---
 
