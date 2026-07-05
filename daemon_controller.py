@@ -323,7 +323,7 @@ def handle_mount(payload):
     # Provision machine account for ACL grants
     tool_machine = user_provisioner.provision_machine_account(tool)
 
-    # Grant ACL on the user's personal files directory (not the full home)
+    # Grant ACL access to personal files directory
     source_user.mkdir(parents=True, exist_ok=True)
     source_files.mkdir(parents=True, exist_ok=True)
     acl_manager.grant_acl_access(tool_machine, str(source_files), "rwx")
@@ -336,7 +336,7 @@ def handle_mount(payload):
     if quota_info.get("exceeded"):
         quota_warning = "Quota exceeded!"
 
-    # User (my_files) Mount — bind only the personal files subdir, not the full home
+    # Mount user personal files directory
     user_already_mounted = _is_mountpoint(target_user)
     if not user_already_mounted:
         try:
@@ -345,8 +345,7 @@ def handle_mount(payload):
             return {"error": f"User mount failed: {exc}"}, 500
     mount_points.append(f"{source_files} → {target_user}")
 
-    # Create empty account navigation folders under my_groups (no bind mounts).
-    # Deduplication: track which account_ids have already been created.
+    # Create account directories under my_groups (deduplicated, no bind mounts)
     mounted_account_ids = set()
     for p in user_projects:
         p_account_id = p["account_id"]
