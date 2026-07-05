@@ -479,7 +479,7 @@ def handle_unmount(payload):
             except OSError as e:
                 log.warning(f"Could not remove {target_path}: {e}")
 
-    # Remove empty dirs inside my_groups (leaving parent and standard folders intact)
+    # Remove dynamic user project directories
     my_groups_dir = tool_session_dir / "my_groups"
     if my_groups_dir.exists():
         import shutil
@@ -490,13 +490,13 @@ def handle_unmount(payload):
                 except Exception as e:
                     log.warning(f"Could not remove dynamic user project dir {item}: {e}")
 
-    # Revoke ACLs for user dir, public, and ALL accounts the user belongs to
+    # Revoke permissions for user and public directories
     tool_machine = f"{tool_lower}_machine"
     source_user = USERS_DIR / f"u{user_id}"
     acl_manager.revoke_acl_access(tool_machine, str(source_user))
     acl_manager.revoke_acl_access(tool_machine, str(PUBLIC_DIR))
 
-    # Revoke for every account/project the user is a member of
+    # Revoke permissions for all associated accounts/projects
     user_projects = state_db.get_user_projects_with_accounts(user_id)
     revoked_account_ids = set()
     for p in user_projects:
