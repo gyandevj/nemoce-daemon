@@ -187,7 +187,7 @@ class NemoSync:
                 self.user_provisioner.sync_user_groups(user_id, list(new_projects))
                 
                 # Sync memberships to permanent Nextcloud group symlinks
-                self._sync_user_my_groups_symlinks(user_id, list(new_projects))
+                # self._sync_user_my_groups_symlinks(user_id, list(new_projects))
 
     def _sync_user_my_groups_symlinks(self, user_id, project_ids):
         import os

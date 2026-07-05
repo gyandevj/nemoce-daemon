@@ -2,13 +2,13 @@ storage:
   base_path: "/tmp/labdata"
   users_path: "/tmp/labdata/users"
   groups_path: "/tmp/labdata/groups"
-  sessions_path: "/tmp/labdata/sessions"
+  sessions_path: "/srv/labdata/sessions"
   public_path: "/tmp/labdata/public"
   # group_folder_type determines whether the groups folder in the Samba share
   # exposes accounts, projects, or nested hierarchical folders at the top level.
   # Options: "project" (default), "account", or "hierarchical".
   # This choice is locked at initial deployment.
-  group_folder_type: "hierarchical"
+  group_folder_type: "account"
 
   # Exclusions: Skip creating group folders and Linux groups for certain NEMO accounts/projects
   # (e.g. system projects or policy accounts like "Administration" or "Buddy" that do not need storage).
@@ -19,7 +19,7 @@ storage:
 
 
 mtls:
-  enabled: true
+  enabled: false
   ca_cert: "certs/ca.crt"
   server_cert: "certs/server.crt"
   server_key: "certs/server.key"
@@ -35,11 +35,11 @@ session:
   unmount_grace_seconds: 30
 
 nemo:
-  django_path: "/mnt/c/Users/gyand/Desktop/NemoProject/nemo-ce"
+  django_path: "/opt/nemo-ce"
   poll_interval_seconds: 3600
-  use_api_http: false
+  use_api_http: true
   api_url: "http://localhost:8000"
-  api_token: "nemo_api_token_here_replace_me"
+  api_token: "7bcbd57d7c8161e65d458dd8c1ae10d3118c7e98"
 
 sync:
   on_deactivation: "lock_account"  # lock_account | remove_membership_only | ignore

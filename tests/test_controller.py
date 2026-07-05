@@ -155,8 +155,12 @@ class TestController(unittest.TestCase):
         res, code = controller.handle_mount(payload)
         self.assertEqual(code, 201)
 
-        # Verify bind mounts called only ONCE (for user directory only, skipped project directory)
-        self.assertEqual(mock_mount.call_count, 1)
+        # Verify bind mounts called twice: once for user directory, once for project 426 (C2QA), but skipped project 500 (Buddy)
+        self.assertEqual(mock_mount.call_count, 2)
+        # Verify that project_500 is not in any of the mount calls
+        for call in mock_mount.call_args_list:
+            args, _ = call
+            self.assertNotIn("project_500", str(args[0]))
 
     @patch('daemon_controller.acl_manager.revoke_acl_access')
     @patch('daemon_controller.graceful_unmount')

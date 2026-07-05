@@ -53,7 +53,7 @@ DEFAULT_CONFIG = {
         "base_path": "/srv/labdata",
         "users_path": "/srv/labdata/users",
         "groups_path": "/srv/labdata/groups",
-        "sessions_path": "/tmp/labdata/sessions",
+        "sessions_path": "/srv/labdata/sessions",
         "public_path": "/srv/labdata/public",
         "group_folder_type": "project",
         "exclude_project_ids": [],
@@ -284,6 +284,7 @@ def handle_mount(payload):
 
     username = user_info["username"]
     source_user = USERS_DIR / f"u{user_id}"
+    source_files = source_user / "files"
     source_project = GROUPS_DIR / f"account_{account_id}" / f"project_{project_id}"
 
     account_info = state_db.get_account_by_id(account_id)
@@ -302,43 +303,30 @@ def handle_mount(payload):
 
     account_name = account_info["name"] if account_info else ""
     project_name = project_info["name"] if project_info else ""
-    account_folder = _safe_name(account_name) if account_name else f"account_{account_id}"
-    project_folder = _safe_name(project_name) if project_name else f"project_{project_id}"
 
     project_excluded = is_project_excluded(project_id, project_name, account_id, account_name)
 
-    group_folder_type = config["storage"].get("group_folder_type", "project")
-    target_user = SESSIONS_DIR / tool / "my_files"
-    target_public = SESSIONS_DIR / tool / "public"
+    tool_lower = tool.lower()
+    group_folder_type = config["storage"].get("group_folder_type", "account")
+    target_user = SESSIONS_DIR / tool_lower / "my_files"
+    target_groups = SESSIONS_DIR / tool_lower / "my_groups"
+    target_public = SESSIONS_DIR / tool_lower / "public"
 
-    if group_folder_type == "account":
-        target_project = SESSIONS_DIR / tool / "my_groups" / account_folder
-    elif group_folder_type == "project":
-        target_project = SESSIONS_DIR / tool / "my_groups" / project_folder
-    else:
-        target_project = SESSIONS_DIR / tool / "my_groups" / account_folder / project_folder
+    # Pre-create standard persistent root tool folders
+    target_user.mkdir(parents=True, exist_ok=True)
+    target_groups.mkdir(parents=True, exist_ok=True)
+    target_public.mkdir(parents=True, exist_ok=True)
 
-    # Create directories
-    try:
-        source_user.mkdir(parents=True, exist_ok=True)
-        target_user.mkdir(parents=True, exist_ok=True)
-        target_public.mkdir(parents=True, exist_ok=True)
-        if not project_excluded:
-            source_project.mkdir(parents=True, exist_ok=True)
-            target_project.parent.mkdir(parents=True, exist_ok=True)
-            target_project.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return {"error": f"Failed to create mount directories: {exc}"}, 500
+    # Fetch ALL accounts/projects this user belongs to
+    user_projects = state_db.get_user_projects_with_accounts(user_id)
 
-    # ACL Permissions
+    # Provision machine account for ACL grants
     tool_machine = user_provisioner.provision_machine_account(tool)
-    acl_manager.grant_acl_access(tool_machine, str(source_user), "rwx")
-    if not project_excluded:
-        acc_dir = GROUPS_DIR / f"account_{account_id}"
-        acl_manager.grant_acl_access(tool_machine, str(acc_dir), "x")
-        acl_manager.grant_acl_access(tool_machine, str(source_project), "rwx")
-    if PUBLIC_DIR.exists() and PUBLIC_DIR.is_dir():
-        acl_manager.grant_acl_access(tool_machine, str(PUBLIC_DIR), "rx")
+
+    # Grant ACL on the user's personal files directory (not the full home)
+    source_user.mkdir(parents=True, exist_ok=True)
+    source_files.mkdir(parents=True, exist_ok=True)
+    acl_manager.grant_acl_access(tool_machine, str(source_files), "rwx")
 
     mount_points = []
     quota_warning = None
@@ -348,26 +336,71 @@ def handle_mount(payload):
     if quota_info.get("exceeded"):
         quota_warning = "Quota exceeded!"
 
-    # User Mount
+    # User (my_files) Mount — bind only the personal files subdir, not the full home
     user_already_mounted = _is_mountpoint(target_user)
     if not user_already_mounted:
         try:
-            _mount_bind(source_user, target_user)
+            _mount_bind(source_files, target_user)
         except OSError as exc:
             return {"error": f"User mount failed: {exc}"}, 500
-    mount_points.append(f"{source_user} → {target_user}")
+    mount_points.append(f"{source_files} → {target_user}")
 
-    # Project Mount
-    if not project_excluded:
-        project_already_mounted = _is_mountpoint(target_project)
-        if not project_already_mounted:
-            try:
-                _mount_bind(source_project, target_project)
-            except OSError as exc:
-                log.error(f"Project mount failed: {exc}")
-        mount_points.append(f"{source_project} → {target_project}")
+    # Create empty account navigation folders under my_groups (no bind mounts).
+    # Deduplication: track which account_ids have already been created.
+    mounted_account_ids = set()
+    for p in user_projects:
+        p_account_id = p["account_id"]
+        p_account_name = p["account_name"]
+        p_project_id = p["project_id"]
+        p_project_name = p["project_name"]
+
+        if is_project_excluded(p_project_id, p_project_name, p_account_id, p_account_name):
+            continue
+
+        acc_fold = _safe_name(p_account_name) if p_account_name else f"account_{p_account_id}"
+        proj_fold = _safe_name(p_project_name) if p_project_name else f"project_{p_project_id}"
+
+        source_acc_dir = GROUPS_DIR / f"account_{p_account_id}"
+        source_acc_dir.mkdir(parents=True, exist_ok=True)
+
+        if group_folder_type == "account":
+            if p_account_id not in mounted_account_ids:
+                target_acc = target_groups / acc_fold
+                target_acc.mkdir(parents=True, exist_ok=True)
+                mounted_account_ids.add(p_account_id)
+        elif group_folder_type == "project":
+            # Each project gets its own folder
+            target_proj = target_groups / proj_fold
+            target_proj.mkdir(parents=True, exist_ok=True)
+            source_proj_dir = source_acc_dir / f"project_{p_project_id}"
+            source_proj_dir.mkdir(parents=True, exist_ok=True)
+            acl_manager.grant_acl_access(tool_machine, str(source_acc_dir), "x")
+            acl_manager.grant_acl_access(tool_machine, str(source_proj_dir), "rwx")
+            if not _is_mountpoint(target_proj):
+                try:
+                    _mount_bind(source_proj_dir, target_proj)
+                    mount_points.append(f"{source_proj_dir} → {target_proj}")
+                except OSError as exc:
+                    log.error(f"Project mount failed for {proj_fold}: {exc}")
+        else:
+            # Hierarchical: account/project
+            target_acc = target_groups / acc_fold
+            target_proj = target_acc / proj_fold
+            target_proj.mkdir(parents=True, exist_ok=True)
+            source_proj_dir = source_acc_dir / f"project_{p_project_id}"
+            source_proj_dir.mkdir(parents=True, exist_ok=True)
+            acl_manager.grant_acl_access(tool_machine, str(source_acc_dir), "x")
+            acl_manager.grant_acl_access(tool_machine, str(source_proj_dir), "rwx")
+            if not _is_mountpoint(target_proj):
+                try:
+                    _mount_bind(source_proj_dir, target_proj)
+                    mount_points.append(f"{source_proj_dir} → {target_proj}")
+                except OSError as exc:
+                    log.error(f"Project mount failed for {acc_fold}/{proj_fold}: {exc}")
 
     # Public Mount
+    if PUBLIC_DIR.exists() and PUBLIC_DIR.is_dir():
+        acl_manager.grant_acl_access(tool_machine, str(PUBLIC_DIR), "rx")
     public_already_mounted = _is_mountpoint(target_public)
     if not public_already_mounted and PUBLIC_DIR.exists() and PUBLIC_DIR.is_dir():
         try:
@@ -381,7 +414,7 @@ def handle_mount(payload):
     resp = {
         "status": "already_mounted" if user_already_mounted else "mounted",
         "path": str(target_user),
-        "project_path": str(target_project) if not project_excluded else None,
+        "groups_path": str(target_groups),
         "session_id": session_id
     }
     if quota_warning:
@@ -406,7 +439,8 @@ def handle_unmount(payload):
                 session_id = s_id
                 break
 
-    tool_session_dir = SESSIONS_DIR / tool
+    tool_lower = tool.lower()
+    tool_session_dir = SESSIONS_DIR / tool_lower
     live_mounts = []
     try:
         with open("/proc/mounts", "r") as f:
@@ -423,6 +457,13 @@ def handle_unmount(payload):
     grace_seconds = config["session"]["unmount_grace_seconds"]
     unmount_success = True
 
+    persistent_dirs = {
+        tool_session_dir,
+        tool_session_dir / "my_files",
+        tool_session_dir / "my_groups",
+        tool_session_dir / "public"
+    }
+
     if live_mounts:
         for mp in live_mounts:
             target_path = Path(mp)
@@ -430,35 +471,44 @@ def handle_unmount(payload):
                 unmount_success = False
             time.sleep(0.3)
             try:
-                if target_path.exists() and not _is_mountpoint(target_path):
-                    target_path.rmdir()
+                # Do NOT remove standard persistent directories
+                abs_path = target_path.resolve()
+                if abs_path in [p.resolve() for p in persistent_dirs]:
+                    continue
+                if abs_path.exists() and not _is_mountpoint(abs_path):
+                    abs_path.rmdir()
             except OSError as e:
                 log.warning(f"Could not remove {target_path}: {e}")
 
-    # Remove empty dirs
-    def _rmdir_if_empty(path: Path):
-        try:
-            if path.exists() and not _is_mountpoint(path) and not list(path.iterdir()):
-                path.rmdir()
-                log.info(f"Removed empty dir: {path}")
-        except OSError:
-            pass
+    # Remove empty dirs inside my_groups (leaving parent and standard folders intact)
+    my_groups_dir = tool_session_dir / "my_groups"
+    if my_groups_dir.exists():
+        import shutil
+        for item in my_groups_dir.iterdir():
+            if item.is_dir() and not _is_mountpoint(item):
+                try:
+                    shutil.rmtree(item)
+                except Exception as e:
+                    log.warning(f"Could not remove dynamic user project dir {item}: {e}")
 
-    if tool_session_dir.exists():
-        for dirpath, dirnames, filenames in os.walk(str(tool_session_dir), topdown=False):
-            _rmdir_if_empty(Path(dirpath))
-        _rmdir_if_empty(tool_session_dir)
-
-    # Revoke ACLs
-    tool_machine = f"{tool.lower()}_machine"
+    # Revoke ACLs for user dir, public, and ALL accounts the user belongs to
+    tool_machine = f"{tool_lower}_machine"
     source_user = USERS_DIR / f"u{user_id}"
-    source_project = GROUPS_DIR / f"account_{account_id}" / f"project_{project_id}"
-    acc_dir = GROUPS_DIR / f"account_{account_id}"
-
     acl_manager.revoke_acl_access(tool_machine, str(source_user))
-    acl_manager.revoke_acl_access(tool_machine, str(source_project))
-    acl_manager.revoke_acl_access(tool_machine, str(acc_dir))
     acl_manager.revoke_acl_access(tool_machine, str(PUBLIC_DIR))
+
+    # Revoke for every account/project the user is a member of
+    user_projects = state_db.get_user_projects_with_accounts(user_id)
+    revoked_account_ids = set()
+    for p in user_projects:
+        p_account_id = p["account_id"]
+        p_project_id = p["project_id"]
+        acc_dir = GROUPS_DIR / f"account_{p_account_id}"
+        proj_dir = acc_dir / f"project_{p_project_id}"
+        if p_account_id not in revoked_account_ids:
+            acl_manager.revoke_acl_access(tool_machine, str(acc_dir))
+            revoked_account_ids.add(p_account_id)
+        acl_manager.revoke_acl_access(tool_machine, str(proj_dir))
 
     if session_id:
         state_db.remove_session(session_id)
@@ -467,6 +517,7 @@ def handle_unmount(payload):
         return {"status": "unmounted"}, 200
     else:
         return {"error": "Failed to unmount cleanly"}, 500
+
 
 def handle_init_user(payload):
     user_id = payload.get("user_id")

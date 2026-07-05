@@ -293,6 +293,25 @@ class StateDB:
         finally:
             conn.close()
 
+    def get_user_projects_with_accounts(self, user_id: int) -> list:
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT p.id as project_id, p.name as project_name, a.id as account_id, a.name as account_name
+                FROM projects p
+                JOIN accounts a ON p.account_id = a.id
+                JOIN memberships m ON p.id = m.project_id
+                WHERE m.user_id = ? AND p.active = 1 AND a.active = 1
+            """, (user_id,))
+            return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Failed to query user projects with accounts for user {user_id}: {e}")
+            return []
+        finally:
+            conn.close()
+
+
     def get_project_by_id(self, project_id: int) -> dict:
         """Return project row (id, account_id, name, linux_group, path, active) or None."""
         conn = self._get_connection()

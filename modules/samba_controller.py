@@ -38,7 +38,7 @@ class SambaController:
             return handles
 
         # We want to find files opened under the machine's session folder, e.g., /tmp/labdata/sessions/microscope1/
-        machine_session_path = f"{self.sessions_path}/{machine_id}"
+        machine_session_path = f"{self.sessions_path}/{machine_id.lower()}"
         
         # Try JSON parsing if Samba supports it (smbstatus -L -j is supported in newer Samba versions)
         # However, standard smbstatus -L is text. Let's parse text.
