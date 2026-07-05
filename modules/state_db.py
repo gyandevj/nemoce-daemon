@@ -294,6 +294,7 @@ class StateDB:
             conn.close()
 
     def get_user_projects_with_accounts(self, user_id: int) -> list:
+        """Fetch all active projects and accounts associated with a user."""
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
