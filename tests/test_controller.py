@@ -33,7 +33,7 @@ session:
   socket_path: "{tempfile.gettempdir()}/labdata/lab-daemon.sock"
 
 nemo:
-  django_path: "/mnt/c/Users/gyand/Desktop/NemoProject/nemo-ce"
+  django_path: "{str(Path(__file__).resolve().parent.parent.parent / 'nemo-ce')}"
   poll_interval_seconds: 3600
 
 sync:

@@ -1,6 +1,7 @@
 import os
 import unittest
 import sys
+from pathlib import Path
 
 # Add parent directory to path
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -12,7 +13,7 @@ from modules.nemo_api_client import NemoAPIClient
 class TestNemoAPIClient(unittest.TestCase):
     def setUp(self):
         # We point to the local Django project directory
-        self.django_path = "/mnt/c/Users/gyand/Desktop/NemoProject/nemo-ce"
+        self.django_path = str(Path(__file__).resolve().parent.parent.parent / "nemo-ce")
         self.client = NemoAPIClient(self.django_path)
 
     def test_django_initialization(self):

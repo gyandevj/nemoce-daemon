@@ -72,7 +72,7 @@ DEFAULT_CONFIG = {
         "unmount_grace_seconds": 30
     },
     "nemo": {
-        "django_path": "/mnt/c/Users/gyand/Desktop/NemoProject/nemo-ce",
+        "django_path": str(Path(__file__).resolve().parent.parent / "nemo-ce"),
         "poll_interval_seconds": 3600,
         "use_api_http": False,
         "api_url": "http://localhost:8000",
@@ -145,36 +145,24 @@ MS_REMOUNT = 32
 
 def _mount_bind(source: Path, target: Path) -> None:
     target.mkdir(parents=True, exist_ok=True)
-    if not _libc:
-        log.warning(f"Mocking Bind Mount: {source} → {target}")
-        return
-    ret = _libc.mount(str(source).encode(), str(target).encode(), None, MS_BIND, None)
-    if ret != 0:
-        err = ctypes.get_errno()
-        raise OSError(err, os.strerror(err))
+    try:
+        subprocess.run(["mount", "--bind", str(source), str(target)], check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        raise OSError(e.returncode, f"mount --bind failed: {e.stderr.decode().strip()}")
 
 def _mount_bind_ro(source: Path, target: Path) -> None:
     target.mkdir(parents=True, exist_ok=True)
-    if not _libc:
-        log.warning(f"Mocking RO Bind Mount: {source} → {target}")
-        return
-    ret = _libc.mount(str(source).encode(), str(target).encode(), None, MS_BIND, None)
-    if ret != 0:
-        err = ctypes.get_errno()
-        raise OSError(err, os.strerror(err))
-    ret = _libc.mount(None, str(target).encode(), None, MS_BIND | MS_REMOUNT | MS_RDONLY, None)
-    if ret != 0:
-        err = ctypes.get_errno()
-        raise OSError(err, os.strerror(err))
+    try:
+        subprocess.run(["mount", "--bind", str(source), str(target)], check=True, capture_output=True)
+        subprocess.run(["mount", "-o", "remount,ro,bind", str(target)], check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        raise OSError(e.returncode, f"mount RO failed: {e.stderr.decode().strip()}")
 
 def _umount(target: Path) -> None:
-    if not _libc:
-        log.warning(f"Mocking Unmount: {target}")
-        return
-    ret = _libc.umount(str(target).encode())
-    if ret != 0:
-        err = ctypes.get_errno()
-        raise OSError(err, os.strerror(err))
+    try:
+        subprocess.run(["umount", str(target)], check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        raise OSError(e.returncode, f"umount failed: {e.stderr.decode().strip()}")
 
 def _is_mountpoint(path: Path) -> bool:
     if not path.exists():

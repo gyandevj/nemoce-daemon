@@ -12,6 +12,13 @@ import sqlite3
 import socket
 from pathlib import Path
 
+# Resolve project paths dynamically
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _SCRIPT_DIR.parent
+_NEMO_CE = _PROJECT_ROOT / "nemo-ce"
+_VENV_PYTHON = _NEMO_CE / "venv" / "bin" / "python"
+_DAEMON_PY = _SCRIPT_DIR / "daemon.py"
+
 # Config
 SECRET_KEY = b"00d57012a01b31f8364ebdcda42f05d15c3fd5585c69be1b8cdec1c30caa3af7"
 BASE_URL = "http://127.0.0.1:5000"
@@ -75,7 +82,7 @@ def start_daemon():
     if not port_in_use:
         print("Starting daemon in background...")
         daemon_proc = subprocess.Popen(
-            ["/mnt/c/Users/gyand/Desktop/NemoProject/nemo-ce/venv/bin/python", "-u", "/mnt/c/Users/gyand/Desktop/NemoProject/lab-daemon/daemon.py"],
+            [str(_VENV_PYTHON), "-u", str(_DAEMON_PY)],
             stdout=open("/tmp/daemon.log", "w"),
             stderr=subprocess.STDOUT
         )
@@ -333,9 +340,9 @@ def run_tests():
     # ----------------------------------------------------
     try:
         nemo_check = subprocess.run(
-            ["/mnt/c/Users/gyand/Desktop/NemoProject/nemo-ce/venv/bin/python", "-c", "import os, django; os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'settings'); django.setup(); import NEMO.plugins.lab_mount.signals; print('OK')"],
+            [str(_VENV_PYTHON), "-c", "import os, django; os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'settings'); django.setup(); import NEMO.plugins.lab_mount.signals; print('OK')"],
             capture_output=True, text=True,
-            cwd="/mnt/c/Users/gyand/Desktop/NemoProject/nemo-ce"
+            cwd=str(_NEMO_CE)
         )
         plugin_imported = nemo_check.returncode == 0 and "OK" in nemo_check.stdout
         log_test("Test 11: NEMO Plugin Integration", plugin_imported, f"- Stderr: {nemo_check.stderr}" if not plugin_imported else "")
@@ -381,11 +388,11 @@ event.save()
         e2e_env["FILESERVER_DAEMON_URL"] = "http://127.0.0.1:5000"
         
         e2e_run = subprocess.run(
-            ["/mnt/c/Users/gyand/Desktop/NemoProject/nemo-ce/venv/bin/python"],
+            [str(_VENV_PYTHON)],
             input=django_code,
             capture_output=True,
             text=True,
-            cwd="/mnt/c/Users/gyand/Desktop/NemoProject/nemo-ce",
+            cwd=str(_NEMO_CE),
             env=e2e_env
         )
         
