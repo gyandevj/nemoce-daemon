@@ -41,8 +41,10 @@ class StateDB:
                 if not fd:
                     # Alternative: lock a separate lock file
                     lock_file_path = self.db_path + ".lock"
-                    self._lock_file = open(lock_file_path, "w")
-                    fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX)
+                    lock_file = open(lock_file_path, "w")
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                    # Store reference in connection object to avoid race conditions with multiple threads
+                    conn._flock_file = lock_file
                 else:
                     fcntl.flock(fd, fcntl.LOCK_EX)
             except Exception as e:
@@ -52,9 +54,9 @@ class StateDB:
         if fcntl:
             try:
                 fd = conn.fileno() if hasattr(conn, 'fileno') else None
-                if not fd and hasattr(self, '_lock_file'):
-                    fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
-                    self._lock_file.close()
+                if not fd and hasattr(conn, '_flock_file'):
+                    fcntl.flock(conn._flock_file.fileno(), fcntl.LOCK_UN)
+                    conn._flock_file.close()
                 elif fd:
                     fcntl.flock(fd, fcntl.LOCK_UN)
             except Exception as e:

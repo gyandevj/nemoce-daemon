@@ -101,22 +101,24 @@ class IdleMonitor(threading.Thread):
 
     def _get_last_activity(self, folder_path: Path) -> float:
         """
-        Finds the maximum access/modification time of any file/folder in the directory.
+        Finds the maximum modification time of any file/folder in the directory.
+        We track modification time (st_mtime) rather than access time (st_atime)
+        to prevent atime update feedback loops (where directory scans reset the idle timer).
         """
         if not folder_path.exists():
             return 0.0
         
         try:
             # Check the base directory itself
-            max_time = folder_path.stat().st_atime
+            max_time = folder_path.stat().st_mtime
             
-            # Walk directory tree recursively to find latest read or write
+            # Walk directory tree recursively to find latest write
             for root, dirs, files in os.walk(str(folder_path)):
                 for name in dirs + files:
                     p = Path(root) / name
                     try:
                         stat_val = p.stat()
-                        max_time = max(max_time, stat_val.st_atime, stat_val.st_mtime)
+                        max_time = max(max_time, stat_val.st_mtime)
                     except Exception:
                         pass
             return max_time

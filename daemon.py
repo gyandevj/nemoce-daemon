@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Lab Data Mount Daemon Controller (Privileged Worker)
-===================================================
-Runs as root. Listens on a local Unix socket.
+Lab Data Mount Daemon (Monolithic Single-Server Version)
+=======================================================
+Runs as root. Exposes Flask API endpoints directly to NEMO.
 Handles low-level operations (mount, umount, setfacl, setquota).
 Also hosts background threads for NemoSync and IdleMonitor.
+Secured by HMAC-SHA256 signature verification.
 """
 
 import os
@@ -12,17 +13,24 @@ import sys
 import time
 import json
 import socket
-import grp
-import pwd
+try:
+    import grp
+    import pwd
+except ImportError:
+    grp = None
+    pwd = None
 import ctypes
 import ctypes.util
 import logging
 import subprocess
 import threading
 import signal
+import hashlib
+import hmac
 from pathlib import Path
 
 import yaml
+from flask import Flask, jsonify, request
 
 # Import custom modules
 from modules.state_db import StateDB
@@ -30,7 +38,6 @@ from modules.nemo_api_client import NemoAPIClient
 from modules.user_provisioner import UserProvisioner
 from modules.samba_controller import SambaController
 from modules.nemo_sync import NemoSync
-from modules.socket_comm import send_msg, recv_msg
 from idle_monitor import IdleMonitor
 import acl_manager
 import quota_manager
@@ -42,13 +49,14 @@ log = logging.getLogger("lab-daemon")
 log.setLevel(logging.INFO)
 if not log.handlers:
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] (Controller) %(message)s'))
+    handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] (Daemon) %(message)s'))
     log.addHandler(handler)
 
 # ---------------------------------------------------------------------------
 # Configuration Loading
 # ---------------------------------------------------------------------------
 DEFAULT_CONFIG = {
+    "shared_secret": "00d57012a01b31f8364ebdcda42f05d15c3fd5585c69be1b8cdec1c30caa3af7",
     "storage": {
         "base_path": "/srv/labdata",
         "users_path": "/srv/labdata/users",
@@ -67,12 +75,11 @@ DEFAULT_CONFIG = {
     },
     "session": {
         "db_path": "/var/lib/lab-daemon/state.db",
-        "socket_path": "/var/run/lab-daemon/lab-daemon.sock",
         "idle_timeout_minutes": 60,
-        "unmount_grace_seconds": 30
+        "unmount_grace_seconds": 10
     },
     "nemo": {
-        "django_path": "/mnt/c/Users/gyand/Desktop/NemoProject/nemo-ce",
+        "django_path": str(Path(__file__).resolve().parent.parent / "nemo-ce"),
         "poll_interval_seconds": 3600,
         "use_api_http": False,
         "api_url": "http://localhost:8000",
@@ -81,6 +88,12 @@ DEFAULT_CONFIG = {
     "sync": {
         "on_deactivation": "lock_account",
         "dry_run": False
+    },
+    "mtls": {
+        "enabled": False,
+        "ca_cert": "certs/ca.crt",
+        "server_cert": "certs/server.crt",
+        "server_key": "certs/server.key"
     }
 }
 
@@ -99,9 +112,11 @@ if config_path:
             user_config = yaml.safe_load(f)
             if user_config:
                 # Merge nested dicts
-                for key in ("storage", "quota", "session", "nemo", "sync"):
+                for key in ("storage", "quota", "session", "nemo", "sync", "mtls"):
                     if key in user_config and isinstance(user_config[key], dict):
                         config[key].update(user_config[key])
+                if "shared_secret" in user_config:
+                    config["shared_secret"] = user_config["shared_secret"]
         log.info(f"Loaded configuration from: {config_path}")
     except Exception as e:
         log.error(f"Error loading configuration from {config_path}: {e}")
@@ -145,36 +160,24 @@ MS_REMOUNT = 32
 
 def _mount_bind(source: Path, target: Path) -> None:
     target.mkdir(parents=True, exist_ok=True)
-    if not _libc:
-        log.warning(f"Mocking Bind Mount: {source} → {target}")
-        return
-    ret = _libc.mount(str(source).encode(), str(target).encode(), None, MS_BIND, None)
-    if ret != 0:
-        err = ctypes.get_errno()
-        raise OSError(err, os.strerror(err))
+    try:
+        subprocess.run(["mount", "--bind", str(source), str(target)], check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        raise OSError(e.returncode, f"mount --bind failed: {e.stderr.decode().strip()}")
 
 def _mount_bind_ro(source: Path, target: Path) -> None:
     target.mkdir(parents=True, exist_ok=True)
-    if not _libc:
-        log.warning(f"Mocking RO Bind Mount: {source} → {target}")
-        return
-    ret = _libc.mount(str(source).encode(), str(target).encode(), None, MS_BIND, None)
-    if ret != 0:
-        err = ctypes.get_errno()
-        raise OSError(err, os.strerror(err))
-    ret = _libc.mount(None, str(target).encode(), None, MS_BIND | MS_REMOUNT | MS_RDONLY, None)
-    if ret != 0:
-        err = ctypes.get_errno()
-        raise OSError(err, os.strerror(err))
+    try:
+        subprocess.run(["mount", "--bind", str(source), str(target)], check=True, capture_output=True)
+        subprocess.run(["mount", "-o", "remount,ro,bind", str(target)], check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        raise OSError(e.returncode, f"mount RO failed: {e.stderr.decode().strip()}")
 
 def _umount(target: Path) -> None:
-    if not _libc:
-        log.warning(f"Mocking Unmount: {target}")
-        return
-    ret = _libc.umount(str(target).encode())
-    if ret != 0:
-        err = ctypes.get_errno()
-        raise OSError(err, os.strerror(err))
+    try:
+        subprocess.run(["umount", str(target)], check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        raise OSError(e.returncode, f"umount failed: {e.stderr.decode().strip()}")
 
 def _is_mountpoint(path: Path) -> bool:
     if not path.exists():
@@ -285,7 +288,6 @@ def handle_mount(payload):
     username = user_info["username"]
     source_user = USERS_DIR / f"u{user_id}"
     source_files = source_user / "files"
-    source_project = GROUPS_DIR / f"account_{account_id}" / f"project_{project_id}"
 
     account_info = state_db.get_account_by_id(account_id)
     project_info = state_db.get_project_by_id(project_id)
@@ -303,8 +305,6 @@ def handle_mount(payload):
 
     account_name = account_info["name"] if account_info else ""
     project_name = project_info["name"] if project_info else ""
-
-    project_excluded = is_project_excluded(project_id, project_name, account_id, account_name)
 
     tool_lower = tool.lower()
     group_folder_type = config["storage"].get("group_folder_type", "account")
@@ -438,6 +438,25 @@ def handle_unmount(payload):
                 session_id = s_id
                 break
 
+    # Quota ownership sync: chown user files to u{user_id}:nogroup and project files to root:proj_{project_id}
+    # This ensures files written over Samba (which forces user root) are accounted for in user/group quotas.
+    try:
+        source_user = USERS_DIR / f"u{user_id}"
+        if source_user.exists():
+            log.info(f"💾 Quota ownership sync: chown -R -h u{user_id}:nogroup for {source_user}")
+            subprocess.run(["chown", "-R", "-h", f"u{user_id}:nogroup", str(source_user)], capture_output=True)
+    except Exception as e:
+        log.error(f"Failed to chown user directory {source_user} for quota update: {e}")
+
+    try:
+        if project_id:
+            proj_dir = GROUPS_DIR / f"account_{account_id}" / f"project_{project_id}"
+            if proj_dir.exists():
+                log.info(f"💾 Quota ownership sync: chown -R -h root:proj_{project_id} for {proj_dir}")
+                subprocess.run(["chown", "-R", "-h", f"root:proj_{project_id}", str(proj_dir)], capture_output=True)
+    except Exception as e:
+        log.error(f"Failed to chown project directory {proj_dir} for quota update: {e}")
+
     tool_lower = tool.lower()
     tool_session_dir = SESSIONS_DIR / tool_lower
     live_mounts = []
@@ -456,39 +475,25 @@ def handle_unmount(payload):
     grace_seconds = config["session"]["unmount_grace_seconds"]
     unmount_success = True
 
-    persistent_dirs = {
-        tool_session_dir,
-        tool_session_dir / "my_files",
-        tool_session_dir / "my_groups",
-        tool_session_dir / "public"
-    }
-
     if live_mounts:
         for mp in live_mounts:
             target_path = Path(mp)
             if not graceful_unmount(target_path, grace_seconds):
                 unmount_success = False
             time.sleep(0.3)
-            try:
-                # Do NOT remove standard persistent directories
-                abs_path = target_path.resolve()
-                if abs_path in [p.resolve() for p in persistent_dirs]:
-                    continue
-                if abs_path.exists() and not _is_mountpoint(abs_path):
-                    abs_path.rmdir()
-            except OSError as e:
-                log.warning(f"Could not remove {target_path}: {e}")
 
-    # Remove dynamic user project directories
+    # Remove dynamic user project directories bottom-up using Path.rmdir (only deletes if empty)
+    # This prevents any recursive deletion of remote user files if an unmount failed.
     my_groups_dir = tool_session_dir / "my_groups"
     if my_groups_dir.exists():
-        import shutil
-        for item in my_groups_dir.iterdir():
-            if item.is_dir() and not _is_mountpoint(item):
-                try:
-                    shutil.rmtree(item)
-                except Exception as e:
-                    log.warning(f"Could not remove dynamic user project dir {item}: {e}")
+        for root, dirs, files in os.walk(str(my_groups_dir), topdown=False):
+            for d in dirs:
+                dir_path = Path(root) / d
+                if not _is_mountpoint(dir_path):
+                    try:
+                        dir_path.rmdir()
+                    except OSError:
+                        pass
 
     # Revoke permissions for user and public directories
     tool_machine = f"{tool_lower}_machine"
@@ -516,7 +521,6 @@ def handle_unmount(payload):
         return {"status": "unmounted"}, 200
     else:
         return {"error": "Failed to unmount cleanly"}, 500
-
 
 def handle_init_user(payload):
     user_id = payload.get("user_id")
@@ -609,7 +613,6 @@ def auto_unmount_session(user_id, tool, session_id):
         _rmdir_if_empty(tool_session_dir)
 
     # Revoke POSIX ACLs
-    # Look up session's project/account from database before removing
     acl_manager.revoke_acl_access(f"{tool.lower()}_machine", str(USERS_DIR / f"u{user_id}"))
     acl_manager.revoke_acl_access(f"{tool.lower()}_machine", str(PUBLIC_DIR))
     
@@ -640,180 +643,248 @@ idle_monitor = IdleMonitor(
 )
 
 # ---------------------------------------------------------------------------
-# Unix Socket Server Loop
+# Flask App Setup
 # ---------------------------------------------------------------------------
-class SocketServer:
-    def __init__(self, socket_path):
-        self.socket_path = socket_path
-        self.server_sock = None
-        self._running = False
-        self._thread = None
+app = Flask(__name__)
 
-    def start(self):
-        self._running = True
-        self._thread = threading.Thread(target=self._run_loop, name="socket-server", daemon=True)
-        self._thread.start()
+def verify_client_auth() -> bool:
+    """
+    Verify Mutual TLS (mTLS) client certificate verification from Nginx proxy.
+    """
+    client_verify = request.headers.get("X-Client-Verify")
+    if client_verify:
+        if client_verify != "SUCCESS":
+            log.warning(f"🔐 mTLS verification failed: X-Client-Verify is '{client_verify}'")
+            return False
+        return True
+    if config.get("mtls", {}).get("enabled"):
+        log.warning("🔐 mTLS verification failed: X-Client-Verify header is missing")
+        return False
+    return True
 
-    def stop(self):
-        self._running = False
-        if self.server_sock:
-            try:
-                self.server_sock.close()
-            except Exception:
-                pass
-        if self._thread:
-            self._thread.join(timeout=2.0)
-        # Cleanup socket file
-        if os.path.exists(self.socket_path):
-            try:
-                os.unlink(self.socket_path)
-            except Exception:
-                pass
+@app.before_request
+def verify_hmac():
+    """
+    Verify request HMAC-SHA256 signature to protect the daemon control API.
+    """
+    if request.path == "/health":
+        return None
 
-    def _run_loop(self):
-        # Ensure parent directory exists
-        sock_dir = os.path.dirname(self.socket_path)
-        if sock_dir:
-            os.makedirs(sock_dir, exist_ok=True)
-            # Try to chown directory to root:www-data
-            try:
-                # Resolve www-data group gid
-                try:
-                    gid = grp.getgrnam("www-data").gr_gid
-                except KeyError:
-                    gid = os.getgid()
-                os.chown(sock_dir, 0, gid)
-                os.chmod(sock_dir, 0o750)
-            except Exception as e:
-                log.debug(f"Could not set permissions on socket directory: {e}")
+    signature = request.headers.get("X-Daemon-Signature")
+    timestamp_str = request.headers.get("X-Daemon-Timestamp")
 
-        # Cleanup old socket file if exists
-        if os.path.exists(self.socket_path):
-            try:
-                os.unlink(self.socket_path)
-            except OSError:
-                pass
+    if not signature or not timestamp_str:
+        log.warning("🔒 HMAC verification failed: Missing X-Daemon-Signature or X-Daemon-Timestamp header")
+        return jsonify({"error": "Unauthorized: Missing signature or timestamp"}), 401
 
-        self.server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            self.server_sock.bind(self.socket_path)
-            self.server_sock.listen(5)
-        except Exception as e:
-            log.error(f"Failed to bind Unix socket at {self.socket_path}: {e}")
-            self._running = False
-            return
+    try:
+        timestamp = int(timestamp_str)
+    except ValueError:
+        return jsonify({"error": "Unauthorized: Invalid timestamp format"}), 401
 
-        # Set permissions on socket file
-        try:
-            try:
-                gid = grp.getgrnam("www-data").gr_gid
-            except KeyError:
-                gid = os.getgid()
-            os.chown(self.socket_path, 0, gid)
-            os.chmod(self.socket_path, 0o660)
-        except Exception as e:
-            log.debug(f"Could not set permissions on socket file: {e}")
+    now = int(time.time())
+    if abs(now - timestamp) > 300:
+        log.warning(f"🔒 HMAC verification failed: Clock drift too high (client: {timestamp}, server: {now})")
+        return jsonify({"error": "Unauthorized: Request expired or clock out of sync"}), 401
 
-        log.info(f"Controller listening on Unix Socket: {self.socket_path}")
-        self.server_sock.settimeout(1.0)
+    raw_body = request.get_data()
+    message = f"{timestamp}:".encode('utf-8') + raw_body
+    
+    shared_secret = config.get("shared_secret")
+    if not shared_secret:
+        shared_secret = "00d57012a01b31f8364ebdcda42f05d15c3fd5585c69be1b8cdec1c30caa3af7"
 
-        while self._running:
-            try:
-                conn, addr = self.server_sock.accept()
-            except socket.timeout:
-                continue
-            except Exception:
-                break
+    expected_signature = hmac.new(
+        shared_secret.encode('utf-8') if isinstance(shared_secret, str) else shared_secret,
+        message,
+        hashlib.sha256
+    ).hexdigest()
 
-            # Handle connection in a new thread
-            t = threading.Thread(target=self._handle_connection, args=(conn,), daemon=True)
-            t.start()
+    if not hmac.compare_digest(signature, expected_signature):
+        log.warning("🔒 HMAC verification failed: Signature mismatch")
+        return jsonify({"error": "Unauthorized: Signature mismatch"}), 401
 
-    def _handle_connection(self, conn):
-        try:
-            while self._running:
-                cmd = recv_msg(conn)
-                if cmd is None:
-                    break # Connection closed
-                
-                action = cmd.get("action")
-                payload = cmd.get("payload", {})
-                
-                log.debug(f"Received command: {action} with payload {payload}")
-                
-                # Route action
-                try:
-                    if action == "mount":
-                        res, code = handle_mount(payload)
-                        response = {"status": "success" if code in (200, 201) else "error", "code": code, "result": res}
-                    elif action == "unmount":
-                        res, code = handle_unmount(payload)
-                        response = {"status": "success" if code == 200 else "error", "code": code, "result": res}
-                    elif action == "init_user":
-                        res, code = handle_init_user(payload)
-                        response = {"status": "success" if code == 200 else "error", "code": code, "result": res}
-                    elif action == "sessions":
-                        res, code = handle_sessions(payload)
-                        response = {"status": "success", "code": code, "result": res}
-                    elif action == "projects":
-                        res, code = handle_projects(payload)
-                        response = {"status": "success" if code == 200 else "error", "code": code, "result": res}
-                    elif action == "quota":
-                        res, code = handle_quota(payload)
-                        response = {"status": "success" if code == 200 else "error", "code": code, "result": res}
-                    elif action == "health":
-                        response = {"status": "success", "code": 200, "result": {"status": "ok"}}
-                    else:
-                        response = {"status": "error", "code": 400, "error": f"Unknown action: {action}"}
-                except Exception as e:
-                    log.error(f"Error executing action '{action}': {e}", exc_info=True)
-                    response = {"status": "error", "code": 500, "error": str(e)}
-                
-                send_msg(conn, response)
-        except Exception as e:
-            log.error(f"Error in connection handling: {e}")
-        finally:
-            conn.close()
+    return None
+
+def _validate_request():
+    data = request.get_json(silent=True)
+    if data is None:
+        return None, ({"error": "Invalid JSON"}, 400)
+
+    user_id = data.get("user_id")
+    tool = data.get("tool", "").strip()
+    account_id = data.get("account_id")
+    project_id = data.get("project_id")
+
+    if user_id is None or not tool:
+        return None, ({"error": "'user_id' and 'tool' required"}, 400)
+
+    if account_id is None or project_id is None:
+        return None, ({"error": "'account_id' and 'project_id' required"}, 400)
+
+    try:
+        user_id_str = str(user_id).strip()
+        account_id_int = int(account_id)
+        project_id_int = int(project_id)
+    except Exception:
+        return None, ({"error": "Invalid ID format — user_id, account_id, project_id must be integers"}, 400)
+
+    import re
+    if not re.match(r"^[a-zA-Z0-9._-]+$", user_id_str):
+        return None, ({"error": "Invalid characters in 'user_id' — must contain only letters, numbers, dots, hyphens, or underscores"}, 400)
+    if not re.match(r"^[a-zA-Z0-9_-]+$", tool):
+        return None, ({"error": "Invalid characters in 'tool' — must contain only letters, numbers, hyphens, or underscores"}, 400)
+
+    return {
+        "user_id": user_id,
+        "user_id_str": user_id_str,
+        "tool": tool,
+        "account_id": account_id_int,
+        "project_id": project_id_int,
+        "session_id": data.get("session_id")
+    }, None
+
+@app.route("/mount", methods=["POST"])
+def mount():
+    data, err = _validate_request()
+    if err:
+        return jsonify(err[0]), err[1]
+
+    if config.get("mtls", {}).get("enabled") and not verify_client_auth():
+        return jsonify({"error": "Mutual TLS client verification failed"}), 401
+
+    res, code = handle_mount(data)
+    return jsonify(res), code
+
+@app.route("/unmount", methods=["POST"])
+def unmount():
+    data, err = _validate_request()
+    if err:
+        return jsonify(err[0]), err[1]
+
+    if config.get("mtls", {}).get("enabled") and not verify_client_auth():
+        return jsonify({"error": "Mutual TLS client verification failed"}), 401
+
+    res, code = handle_unmount(data)
+    return jsonify(res), code
+
+@app.route("/init_user", methods=["POST"])
+def init_user():
+    data = request.get_json(silent=True)
+    if data is None:
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    user_id = data.get("user_id")
+    if user_id is None:
+        return jsonify({"error": "'user_id' required"}), 400
+
+    # Sanitize and validate user_id to prevent path traversal / argument manipulation
+    user_id_str = str(user_id).strip()
+    import re
+    if not re.match(r"^[a-zA-Z0-9._-]+$", user_id_str):
+        return jsonify({"error": "Invalid characters in 'user_id'"}), 400
+
+    if config.get("mtls", {}).get("enabled") and not verify_client_auth():
+        return jsonify({"error": "Mutual TLS client verification failed"}), 401
+
+    res, code = handle_init_user({"user_id": user_id})
+    return jsonify(res), code
+
+@app.route("/sessions", methods=["GET"])
+def get_sessions():
+    return jsonify(state_db.get_all_sessions()), 200
+
+@app.route("/projects/<int:user_id>", methods=["GET"])
+def get_projects(user_id):
+    return jsonify(state_db.get_project_linux_groups(user_id)), 200
+
+@app.route("/quota/<username_or_id>", methods=["GET"])
+def get_quota(username_or_id):
+    res, code = handle_quota({"username_or_id": username_or_id})
+    return jsonify(res), code
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
 
 # ---------------------------------------------------------------------------
-# Signal Handling & Main Execution
+# Signal Handling & Startup/Shutdown
 # ---------------------------------------------------------------------------
-socket_server = None
-
 def sigterm_handler(signum, frame):
-    log.info("Terminating Controller...")
-    if nemo_sync:
-        nemo_sync.stop()
-    if idle_monitor:
-        idle_monitor.stop()
-    if socket_server:
-        socket_server.stop()
+    log.info("Terminating Daemon...")
+    nemo_sync.stop()
+    idle_monitor.stop()
     sys.exit(0)
 
+def startup_cleanup():
+    """
+    On every daemon start, force-unmount ALL bind mounts under SESSIONS_DIR
+    and wipe the session state from the DB.
+    """
+    log.info("🧹 STARTUP CLEANUP: Wiping all stale session mounts...")
+    stale_mounts = []
+    try:
+        with open("/proc/mounts", "r") as f:
+            for line in f:
+                fields = line.split()
+                if len(fields) >= 2:
+                    mount_point = fields[1].replace("\\040", " ")
+                    if str(SESSIONS_DIR) in mount_point:
+                        stale_mounts.append(mount_point)
+
+        stale_mounts.sort(key=len, reverse=True)
+        for mp in stale_mounts:
+            log.info(f"  Unmounting stale: {mp}")
+            subprocess.run(["umount", "-l", mp], capture_output=True)
+    except Exception as e:
+        log.error(f"Startup cleanup error scanning /proc/mounts: {e}")
+
+    try:
+        import shutil
+        shutil.rmtree(str(SESSIONS_DIR), ignore_errors=True)
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        log.info(f"  Session directory wiped and recreated: {SESSIONS_DIR}")
+    except Exception as e:
+        log.error(f"Startup cleanup error wiping sessions dir: {e}")
+
+    cleared = state_db.clear_all_sessions()
+    log.info(f"🧹 STARTUP CLEANUP DONE: {len(stale_mounts)} mounts removed, {cleared} DB sessions cleared.")
+
 if __name__ == "__main__":
-    # Ensure running as root
-    if os.getuid() != 0 and sys.platform != "win32":
-        log.error("Daemon Controller must run as root!")
+    if os.name != 'nt' and os.getuid() != 0:
+        log.error("Daemon must run as root!")
         sys.exit(1)
 
     signal.signal(signal.SIGTERM, sigterm_handler)
     signal.signal(signal.SIGINT, sigterm_handler)
 
+    # Ensure directories exist
+    USERS_DIR.mkdir(parents=True, exist_ok=True)
+    GROUPS_DIR.mkdir(parents=True, exist_ok=True)
+
+    startup_cleanup()
+
     # Start background loops
     nemo_sync.start()
     idle_monitor.start()
 
-    # Start Unix Socket Server
-    socket_server = SocketServer(config["session"]["socket_path"])
-    socket_server.start()
+    # Start Flask Web Server
+    port = int(os.environ.get("LAB_DAEMON_PORT", 8080))
+    host = "127.0.0.1"
 
-    # Keep main thread alive
-    log.info("Daemon Controller started successfully. Press Ctrl+C to exit.")
-    while True:
-        try:
-            time.sleep(1.0)
-        except KeyboardInterrupt:
-            break
+    context = None
+    if config.get("mtls", {}).get("enabled"):
+        import ssl
+        mtls_conf = config["mtls"]
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(mtls_conf["server_cert"], mtls_conf["server_key"])
+        context.load_verify_locations(mtls_conf["ca_cert"])
+        context.verify_mode = ssl.CERT_REQUIRED
+        log.info("🔒 mTLS Client-Certificate Verification is ENABLED")
 
-    # Clean cleanup
-    sigterm_handler(None, None)
+    log.info(f"Monolithic Daemon listening on HTTP/HTTPS at {host}:{port}")
+    try:
+        app.run(host=host, port=port, debug=False, ssl_context=context)
+    finally:
+        nemo_sync.stop()
+        idle_monitor.stop()

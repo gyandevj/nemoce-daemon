@@ -213,7 +213,9 @@ class NemoSync:
         my_groups_dir = user_dir / "my_groups"
         try:
             my_groups_dir.mkdir(exist_ok=True)
-            subprocess.run(["chown", "-R", f"u{user_id}:nogroup", str(my_groups_dir)], capture_output=True)
+            # Remove recursive chown (-R) to prevent symlink traversal privilege escalation attacks.
+            # Only chown the directory itself with -h (no-dereference).
+            subprocess.run(["chown", "-h", f"u{user_id}:nogroup", str(my_groups_dir)], capture_output=True)
             subprocess.run(["chmod", "770", str(my_groups_dir)], capture_output=True)
         except Exception:
             pass
