@@ -97,7 +97,8 @@ DEFAULT_CONFIG = {
     }
 }
 
-config = DEFAULT_CONFIG.copy()
+import copy
+config = copy.deepcopy(DEFAULT_CONFIG)
 
 config_path = os.environ.get("LAB_DAEMON_CONFIG")
 if not config_path:

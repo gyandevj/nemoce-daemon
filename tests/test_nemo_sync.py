@@ -122,6 +122,9 @@ class TestNemoSync(unittest.TestCase):
         import os
         from pathlib import Path
         
+        if os.name == 'nt':
+            self.skipTest("Skipping symlink test on Windows due to privilege requirements")
+
         with tempfile.TemporaryDirectory() as temp_users_dir:
             self.mock_provisioner.users_path = temp_users_dir
             

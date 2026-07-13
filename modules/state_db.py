@@ -18,6 +18,7 @@ class StateDB:
     """
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._locks = {}
         db_dir = os.path.dirname(self.db_path)
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
@@ -43,8 +44,8 @@ class StateDB:
                     lock_file_path = self.db_path + ".lock"
                     lock_file = open(lock_file_path, "w")
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-                    # Store reference in connection object to avoid race conditions with multiple threads
-                    conn._flock_file = lock_file
+                    # Store reference in self._locks to avoid modifying built-in connection object
+                    self._locks[id(conn)] = lock_file
                 else:
                     fcntl.flock(fd, fcntl.LOCK_EX)
             except Exception as e:
@@ -54,9 +55,10 @@ class StateDB:
         if fcntl:
             try:
                 fd = conn.fileno() if hasattr(conn, 'fileno') else None
-                if not fd and hasattr(conn, '_flock_file'):
-                    fcntl.flock(conn._flock_file.fileno(), fcntl.LOCK_UN)
-                    conn._flock_file.close()
+                if not fd and id(conn) in self._locks:
+                    lock_file = self._locks.pop(id(conn))
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    lock_file.close()
                 elif fd:
                     fcntl.flock(fd, fcntl.LOCK_UN)
             except Exception as e:

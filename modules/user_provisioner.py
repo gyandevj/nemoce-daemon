@@ -139,7 +139,7 @@ class UserProvisioner:
         # Set ownership: u{id}:nogroup
         # On Windows, grp/pwd might be mock so we shell out chown
         try:
-            subprocess.run(["chown", "-R", f"{linux_user}:nogroup", str(user_dir)], capture_output=True)
+            subprocess.run(["chown", "-R", "-h", f"{linux_user}:nogroup", str(user_dir)], capture_output=True)
             subprocess.run(["chmod", "770", str(user_dir)], capture_output=True)
             # Grant NextCloud daemon (www-data) access to read/write this user folder via ACLs
             subprocess.run(["setfacl", "-m", "u:www-data:rwx", str(user_dir)], capture_output=True)
@@ -174,7 +174,7 @@ class UserProvisioner:
         # Set ownership: root:proj_{project_id}
         # Set permissions: 770 (owner/group full access, others none)
         try:
-            subprocess.run(["chown", "-R", f"root:{proj_group}", str(project_dir)], capture_output=True)
+            subprocess.run(["chown", "-R", "-h", f"root:{proj_group}", str(project_dir)], capture_output=True)
             subprocess.run(["chmod", "770", str(project_dir)], capture_output=True)
             
             # Default ACLs so newly created files inherit rwx for group and none for others

@@ -72,6 +72,19 @@ class TestIntegration(unittest.TestCase):
         self.app = daemon.app.test_client()
         self.app.testing = True
         
+        # Set config explicitly for this test class to prevent test pollution
+        import copy
+        daemon.config = copy.deepcopy(daemon.DEFAULT_CONFIG)
+        daemon.config["storage"].update({
+            "base_path": f"{temp_dir_safe}/labdata",
+            "users_path": f"{temp_dir_safe}/labdata/users",
+            "groups_path": f"{temp_dir_safe}/labdata/groups",
+            "sessions_path": f"{temp_dir_safe}/labdata/sessions",
+            "public_path": f"{temp_dir_safe}/labdata/public",
+            "group_folder_type": "hierarchical"
+        })
+        daemon.config["session"]["db_path"] = temp_db_safe
+        
         # Populate DB with a test user & project
         daemon.state_db.upsert_user(
             user_id=146,

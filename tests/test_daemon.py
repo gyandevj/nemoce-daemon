@@ -64,6 +64,21 @@ importlib.reload(controller)
 
 class TestController(unittest.TestCase):
     def setUp(self):
+        # Set config explicitly for this test class to prevent test pollution
+        import copy
+        controller.config = copy.deepcopy(controller.DEFAULT_CONFIG)
+        controller.config["storage"].update({
+            "base_path": f"{temp_dir_safe}/labdata",
+            "users_path": f"{temp_dir_safe}/labdata/users",
+            "groups_path": f"{temp_dir_safe}/labdata/groups",
+            "sessions_path": f"{temp_dir_safe}/labdata/sessions",
+            "public_path": f"{temp_dir_safe}/labdata/public",
+            "group_folder_type": "hierarchical",
+            "exclude_project_names": ["Buddy"],
+            "exclude_account_names": ["Administration"]
+        })
+        controller.config["session"]["db_path"] = temp_db_safe
+
         # Populate DB with a test user, account, project
         controller.state_db.upsert_user(
             user_id=146,
@@ -142,7 +157,6 @@ class TestController(unittest.TestCase):
         self.assertIsNotNone(session)
         self.assertEqual(session["user_id"], 146)
 
-        # Verify bind mounts called twice (user + project)
         self.assertEqual(mock_mount.call_count, 2)
 
     @patch('daemon._is_mountpoint')
@@ -166,7 +180,6 @@ class TestController(unittest.TestCase):
         res, code = controller.handle_mount(payload)
         self.assertEqual(code, 201)
 
-        # Verify bind mounts called twice: once for user directory, once for project 426 (C2QA), but skipped project 500 (Buddy)
         self.assertEqual(mock_mount.call_count, 2)
         # Verify that project_500 is not in any of the mount calls
         for call in mock_mount.call_args_list:
